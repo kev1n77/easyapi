@@ -240,6 +240,7 @@ function RequestsPage({ logs, onRefresh, contentCapture, onCaptureEnabledChange,
 }) {
   const [viewingCapture, setViewingCapture] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [clearingLogs, setClearingLogs] = useState(false);
   const hasCapturedContent = logs.some(log => log.contentCaptured);
 
   async function clearCaptures() {
@@ -256,8 +257,25 @@ function RequestsPage({ logs, onRefresh, contentCapture, onCaptureEnabledChange,
     }
   }
 
+  async function clearLogs() {
+    if (!window.confirm("确定删除全部请求记录吗？请求元数据和已保存的请求与响应内容都会被删除。")) return;
+    setClearingLogs(true);
+    try {
+      await api.clearRequestLogs();
+      setViewingCapture(null);
+      notify("已删除全部请求记录");
+      await onRefresh();
+    } catch (error) {
+      notify(errorText(error));
+    } finally {
+      setClearingLogs(false);
+    }
+  }
+
+  const busy = clearing || clearingLogs;
+
   return <section>
-    <PageHeader title="请求记录" subtitle={contentCapture.enabled ? "正在原样保存新的 Responses 请求和响应内容。" : "仅保存状态、耗时和请求大小；内容记录当前已关闭。"} action={<div className="request-actions"><label className="capture-toggle"><span>记录内容</span><input type="checkbox" checked={contentCapture.enabled} onChange={event => void onCaptureEnabledChange(event.target.checked)} /></label>{(contentCapture.enabled || hasCapturedContent) && <button className="secondary" disabled={clearing} onClick={() => void clearCaptures()}>{clearing ? "清空中…" : "清空内容"}</button>}<button className="secondary" onClick={() => void onRefresh()}>刷新</button></div>} />
+    <PageHeader title="请求记录" subtitle={contentCapture.enabled ? "正在原样保存新的 Responses 请求和响应内容。" : "仅保存状态、耗时和请求大小；内容记录当前已关闭。"} action={<div className="request-actions"><label className="capture-toggle"><span>记录内容</span><input type="checkbox" checked={contentCapture.enabled} onChange={event => void onCaptureEnabledChange(event.target.checked)} /></label>{(contentCapture.enabled || hasCapturedContent) && <button className="secondary" disabled={busy} onClick={() => void clearCaptures()}>{clearing ? "清空中…" : "清空内容"}</button>}{logs.length > 0 && <button className="secondary" disabled={busy} onClick={() => void clearLogs()}>{clearingLogs ? "清理中…" : "清理记录"}</button>}<button className="secondary" onClick={() => void onRefresh()}>刷新</button></div>} />
     <div className="table-panel">
       <table><thead><tr><th>时间</th><th>Provider</th><th>状态</th><th>结果</th><th>请求大小</th><th>耗时</th><th>内容</th><th>错误</th></tr></thead>
         <tbody>{logs.map(log => <tr key={log.id}><td>{formatTime(log.startedAt)}</td><td>{log.providerName ?? "—"}</td><td><span className={`http-status ${log.statusCode && log.statusCode < 400 ? "good" : "bad"}`}>{log.statusCode ?? "ERR"}</span></td><td>{outcomeLabel(log.outcome)}</td><td>{formatBytes(log.requestBytes)}</td><td>{log.durationMs} ms</td><td>{log.contentCaptured ? <button className="content-button" onClick={() => setViewingCapture(log.id)}>查看</button> : "—"}</td><td className="error-cell" title={log.error}>{log.error ?? "—"}</td></tr>)}</tbody>

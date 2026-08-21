@@ -88,5 +88,6 @@ export const api = {
   setContentCaptureEnabled: (enabled: boolean) => invoke<ContentCaptureStatus>("set_content_capture_enabled", { enabled }),
   getRequestCapture: (id: string) => invoke<RequestCapture>("get_request_capture", { id }),
   clearRequestCaptures: () => invoke<void>("clear_request_captures"),
+  clearRequestLogs: () => invoke<void>("clear_request_logs"),
   getCodexSetup: () => invoke<CodexSetup>("get_codex_setup"),
 };

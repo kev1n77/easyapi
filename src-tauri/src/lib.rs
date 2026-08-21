@@ -99,6 +99,7 @@ pub fn run() {
             commands::set_content_capture_enabled,
             commands::get_request_capture,
             commands::clear_request_captures,
+            commands::clear_request_logs,
             commands::get_codex_setup,
             commands::test_provider,
             commands::list_provider_models,

@@ -330,36 +330,50 @@ impl Database {
     }
 
     pub fn clear_request_captures(&self) -> Result<(), String> {
-        let paths = {
-            let conn = self.conn.lock().map_err(|e| e.to_string())?;
-            let mut stmt = conn
-                .prepare("SELECT request_path, response_path FROM request_captures")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                    ))
-                })
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
-        };
-        for (request_path, response_path) in paths {
-            for path in [request_path, response_path].into_iter().flatten() {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(format!("无法删除内容记录文件: {error}")),
-                }
-            }
-        }
+        remove_capture_files(self.capture_paths()?)?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM request_captures", [])
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    pub fn clear_request_logs(&self) -> Result<(), String> {
+        remove_capture_files(self.capture_paths()?)?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM request_logs", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn capture_paths(&self) -> Result<Vec<(Option<String>, Option<String>)>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT request_path, response_path FROM request_captures")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn remove_capture_files(paths: Vec<(Option<String>, Option<String>)>) -> Result<(), String> {
+    for (request_path, response_path) in paths {
+        for path in [request_path, response_path].into_iter().flatten() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("无法删除内容记录文件: {error}")),
+            }
+        }
+    }
+    Ok(())
 }
 
 struct CaptureRow {
@@ -631,5 +645,43 @@ mod tests {
 
         db.clear_request_captures().unwrap();
         assert!(db.get_request_capture("capture-test").is_err());
+    }
+
+    #[test]
+    fn clears_request_logs_and_cascades_content_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("test.sqlite3")).unwrap();
+        db.insert_request_log(&RequestLog {
+            id: "clear-test".to_string(),
+            provider_id: None,
+            provider_name: None,
+            started_at: Utc::now().to_rfc3339(),
+            duration_ms: 1,
+            status_code: Some(200),
+            outcome: "completed".to_string(),
+            error: None,
+            request_bytes: None,
+            content_captured: false,
+        })
+        .unwrap();
+
+        let capture = db
+            .start_content_capture("clear-test", Some("application/json".to_string()))
+            .unwrap();
+        capture.write_request(b"request");
+        capture.mark_request_complete();
+        capture.write_response(b"response");
+        capture.mark_response_complete();
+        db.insert_request_capture("clear-test", &capture.finish())
+            .unwrap();
+
+        db.clear_request_logs().unwrap();
+
+        assert!(db.list_request_logs(None).unwrap().is_empty());
+        assert!(db.get_request_capture("clear-test").is_err());
+        assert!(fs::read_dir(temp.path().join("captures"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 }

@@ -119,6 +119,11 @@ pub fn clear_request_captures(state: State<'_, Arc<AppState>>) -> Result<(), Str
 }
 
 #[tauri::command]
+pub fn clear_request_logs(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.db.clear_request_logs()
+}
+
+#[tauri::command]
 pub fn get_codex_setup(state: State<'_, Arc<AppState>>) -> CodexSetup {
     let config_toml = format!(
         r#"model_provider = "easyapi"
