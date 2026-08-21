@@ -1,4 +1,8 @@
-use std::{io, sync::Arc, time::Instant};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use async_stream::stream;
 use axum::{
@@ -205,11 +209,16 @@ async fn proxy_responses_endpoint(
     }
 
     let mut incoming = body.into_data_stream();
+    let model_extractor = Arc::new(Mutex::new(RequestModelExtractor::default()));
+    let model_extractor_for_stream = model_extractor.clone();
     let request_capture = guard.content_capture();
     let upload_stream = stream! {
         loop {
             match timeout(UPLOAD_IDLE_TIMEOUT, incoming.next()).await {
                 Ok(Some(Ok(bytes))) => {
+                    if let Ok(mut extractor) = model_extractor_for_stream.lock() {
+                        extractor.observe(&bytes);
+                    }
                     if let Some(capture) = &request_capture {
                         capture.write_request(&bytes);
                     }
@@ -233,11 +242,17 @@ async fn proxy_responses_endpoint(
         }
     };
 
-    let upstream = match builder
+    let upstream_result = builder
         .body(reqwest::Body::wrap_stream(upload_stream))
         .send()
-        .await
-    {
+        .await;
+    let model = model_extractor
+        .lock()
+        .ok()
+        .map(|mut extractor| std::mem::take(&mut *extractor).finish())
+        .flatten();
+    guard.set_model(model);
+    let upstream = match upstream_result {
         Ok(response) => response,
         Err(error) => {
             let message = sanitized_reqwest_error(&error);
@@ -273,9 +288,11 @@ async fn proxy_responses_endpoint(
     let mut upstream_stream = upstream.bytes_stream();
     let response_stream = stream! {
         let mut stream_error = None;
+        let mut usage = TokenUsageExtractor::default();
         while let Some(item) = upstream_stream.next().await {
             match item {
                 Ok(bytes) => {
+                    usage.observe(&bytes);
                     if let Some(capture) = &response_capture {
                         capture.write_response(&bytes);
                     }
@@ -290,6 +307,7 @@ async fn proxy_responses_endpoint(
                 }
             }
         }
+        guard.set_usage(usage.finish());
         if stream_error.is_none() {
             if let Some(capture) = &response_capture {
                 capture.mark_response_complete();
@@ -373,6 +391,174 @@ fn sanitized_reqwest_error(error: &reqwest::Error) -> String {
     }
 }
 
+const REQUEST_MODEL_BUFFER_LIMIT: usize = 64 * 1024;
+const USAGE_SCAN_BUFFER_LIMIT: usize = 4 * 1024;
+
+#[derive(Default)]
+struct RequestModelExtractor {
+    buffer: Vec<u8>,
+    model: Option<String>,
+}
+
+impl RequestModelExtractor {
+    fn observe(&mut self, bytes: &[u8]) {
+        if self.model.is_some() {
+            return;
+        }
+        self.buffer.extend_from_slice(bytes);
+        self.model = extract_json_string_field(&self.buffer, b"model");
+        if self.model.is_none() && self.buffer.len() > REQUEST_MODEL_BUFFER_LIMIT {
+            let keep_from = self.buffer.len() - REQUEST_MODEL_BUFFER_LIMIT / 2;
+            self.buffer.drain(..keep_from);
+        }
+    }
+
+    fn finish(self) -> Option<String> {
+        self.model
+            .or_else(|| extract_json_string_field(&self.buffer, b"model"))
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TokenUsage {
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+}
+
+#[derive(Default)]
+struct TokenUsageExtractor {
+    buffer: Vec<u8>,
+    usage: TokenUsage,
+}
+
+impl TokenUsageExtractor {
+    fn observe(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+        if let Some(value) = find_json_number(&self.buffer, b"input_tokens") {
+            self.usage.input_tokens = Some(value);
+        }
+        if let Some(value) = find_json_number(&self.buffer, b"output_tokens") {
+            self.usage.output_tokens = Some(value);
+        }
+        if let Some(value) = find_json_number(&self.buffer, b"total_tokens") {
+            self.usage.total_tokens = Some(value);
+        }
+        if let Some(value) = find_json_number(&self.buffer, b"cached_tokens") {
+            self.usage.cached_input_tokens = Some(value);
+        }
+        if let Some(value) = find_json_number(&self.buffer, b"reasoning_tokens") {
+            self.usage.reasoning_tokens = Some(value);
+        }
+        if self.buffer.len() > USAGE_SCAN_BUFFER_LIMIT {
+            let keep_from = self.buffer.len() - USAGE_SCAN_BUFFER_LIMIT;
+            self.buffer.drain(..keep_from);
+        }
+    }
+
+    fn finish(mut self) -> TokenUsage {
+        self.observe(&[]);
+        self.usage
+    }
+}
+
+fn extract_json_string_field(bytes: &[u8], key: &[u8]) -> Option<String> {
+    let mut needle = Vec::with_capacity(key.len() + 2);
+    needle.push(b'"');
+    needle.extend_from_slice(key);
+    needle.push(b'"');
+    let mut offset = 0;
+    while offset + needle.len() <= bytes.len() {
+        let relative = bytes[offset..]
+            .windows(needle.len())
+            .position(|window| window == needle)?;
+        let start = offset + relative + needle.len();
+        let mut cursor = start;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b':' {
+            offset = start;
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'"' {
+            offset = start;
+            continue;
+        }
+        let value_start = cursor;
+        cursor += 1;
+        let mut escaped = false;
+        while cursor < bytes.len() {
+            match (bytes[cursor], escaped) {
+                (b'"', false) => {
+                    return serde_json::from_slice(&bytes[value_start..=cursor]).ok();
+                }
+                (b'\\', false) => escaped = true,
+                (_, _) => escaped = false,
+            }
+            cursor += 1;
+        }
+        return None;
+    }
+    None
+}
+
+fn find_json_number(bytes: &[u8], key: &[u8]) -> Option<i64> {
+    let mut needle = Vec::with_capacity(key.len() + 2);
+    needle.push(b'"');
+    needle.extend_from_slice(key);
+    needle.push(b'"');
+    let mut offset = 0;
+    let mut result = None;
+    while offset + needle.len() <= bytes.len() {
+        let Some(relative) = bytes[offset..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+        else {
+            break;
+        };
+        let key_end = offset + relative + needle.len();
+        let mut cursor = key_end;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b':' {
+            offset = key_end;
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let number_start = cursor;
+        if cursor < bytes.len() && bytes[cursor] == b'-' {
+            cursor += 1;
+        }
+        let digits_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor == digits_start {
+            offset = key_end;
+            continue;
+        }
+        if let Some(value) = std::str::from_utf8(&bytes[number_start..cursor])
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            result = Some(value);
+        }
+        offset = cursor;
+    }
+    result
+}
+
 struct RequestGuard {
     state: Arc<AppState>,
     id: String,
@@ -384,6 +570,8 @@ struct RequestGuard {
     outcome: String,
     error: Option<String>,
     request_bytes: Option<u64>,
+    model: Option<String>,
+    usage: TokenUsage,
     content_capture: Option<Arc<ContentCapture>>,
 }
 
@@ -409,6 +597,8 @@ impl RequestGuard {
             outcome: "cancelled".to_string(),
             error: None,
             request_bytes,
+            model: None,
+            usage: TokenUsage::default(),
             content_capture: None,
         }
     }
@@ -446,6 +636,14 @@ impl RequestGuard {
     fn content_capture(&self) -> Option<Arc<ContentCapture>> {
         self.content_capture.clone()
     }
+
+    fn set_model(&mut self, model: Option<String>) {
+        self.model = model;
+    }
+
+    fn set_usage(&mut self, usage: TokenUsage) {
+        self.usage = usage;
+    }
 }
 
 impl Drop for RequestGuard {
@@ -456,12 +654,18 @@ impl Drop for RequestGuard {
             id: self.id.clone(),
             provider_id: self.provider_id.clone(),
             provider_name: self.provider_name.clone(),
+            model: self.model.clone(),
             started_at: self.started_at.clone(),
             duration_ms: self.started.elapsed().as_millis().min(i64::MAX as u128) as i64,
             status_code: self.status_code,
             outcome: self.outcome.clone(),
             error,
             request_bytes: self.request_bytes,
+            input_tokens: self.usage.input_tokens,
+            output_tokens: self.usage.output_tokens,
+            total_tokens: self.usage.total_tokens,
+            cached_input_tokens: self.usage.cached_input_tokens,
+            reasoning_tokens: self.usage.reasoning_tokens,
             content_captured: false,
         });
         if let Some(capture) = self.content_capture.take() {
@@ -494,6 +698,52 @@ mod tests {
         assert!(!should_forward_response_header(&header::TRANSFER_ENCODING));
     }
 
+    #[test]
+    fn extracts_model_across_request_chunks() {
+        let mut extractor = RequestModelExtractor::default();
+        extractor.observe(br#"{"mo"#);
+        extractor.observe(br#"del":"gpt-5"}"#);
+        assert_eq!(extractor.finish().as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn extracts_usage_across_response_chunks() {
+        let mut extractor = TokenUsageExtractor::default();
+        extractor.observe(br#"{"usage":{"input_tokens":12,"output_tokens":"#);
+        extractor.observe(br#"34,"total_tokens":46,"input_tokens_details":{"cached_tokens":5},"output_tokens_details":{"reasoning_tokens":7}}}"#);
+        assert_eq!(
+            extractor.finish(),
+            TokenUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(34),
+                total_tokens: Some(46),
+                cached_input_tokens: Some(5),
+                reasoning_tokens: Some(7),
+            }
+        );
+    }
+
+    #[test]
+    fn final_usage_overrides_zero_values_from_earlier_response_events() {
+        let mut extractor = TokenUsageExtractor::default();
+        extractor.observe(
+            br#"event: response.created\ndata: {"response":{"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}\n\n"#,
+        );
+        extractor.observe(
+            br#"event: response.completed\ndata: {"response":{"usage":{"input_tokens":20698,"input_tokens_details":{"cached_tokens":12032},"output_tokens":251,"output_tokens_details":{"reasoning_tokens":102},"total_tokens":20949}}}\n\n"#,
+        );
+        assert_eq!(
+            extractor.finish(),
+            TokenUsage {
+                input_tokens: Some(20698),
+                output_tokens: Some(251),
+                total_tokens: Some(20949),
+                cached_input_tokens: Some(12032),
+                reasoning_tokens: Some(102),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn streams_request_and_response_without_json_buffering() {
         use axum::{body::Bytes, routing::post, Router};
@@ -509,7 +759,7 @@ mod tests {
             let chunks = futures_util::stream::iter([
                 Ok::<_, io::Error>(Bytes::from_static(b"event: response.created\ndata: {}\n\n")),
                 Ok::<_, io::Error>(Bytes::from_static(
-                    b"event: response.completed\ndata: {}\n\n",
+                    b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":34,\"total_tokens\":46,\"input_tokens_details\":{\"cached_tokens\":5},\"output_tokens_details\":{\"reasoning_tokens\":7}}}}\n\n",
                 )),
             ]);
             Response::builder()
@@ -574,7 +824,7 @@ mod tests {
         assert_eq!(
             bytes,
             Bytes::from_static(
-                b"event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\n"
+                b"event: response.created\ndata: {}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":34,\"total_tokens\":46,\"input_tokens_details\":{\"cached_tokens\":5},\"output_tokens_details\":{\"reasoning_tokens\":7}}}}\n\n"
             )
         );
         let capture = state.db.get_request_capture(&request_id).unwrap();
@@ -584,10 +834,18 @@ mod tests {
         );
         assert_eq!(
             capture.response_content.as_deref(),
-            Some("event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\n")
+            Some("event: response.created\ndata: {}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":34,\"total_tokens\":46,\"input_tokens_details\":{\"cached_tokens\":5},\"output_tokens_details\":{\"reasoning_tokens\":7}}}}\n\n")
         );
         assert!(capture.request_complete);
         assert!(capture.response_complete);
+        let logs = state.db.list_request_logs(None).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].model.as_deref(), Some("test"));
+        assert_eq!(logs[0].input_tokens, Some(12));
+        assert_eq!(logs[0].output_tokens, Some(34));
+        assert_eq!(logs[0].total_tokens, Some(46));
+        assert_eq!(logs[0].cached_input_tokens, Some(5));
+        assert_eq!(logs[0].reasoning_tokens, Some(7));
     }
 
     #[tokio::test]

@@ -37,12 +37,18 @@ export type RequestLog = {
   id: string;
   providerId?: string;
   providerName?: string;
+  model?: string;
   startedAt: string;
   durationMs: number;
   statusCode?: number;
   outcome: string;
   error?: string;
   requestBytes?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
   contentCaptured: boolean;
 };
 

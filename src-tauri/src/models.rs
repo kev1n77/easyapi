@@ -59,12 +59,18 @@ pub struct RequestLog {
     pub id: String,
     pub provider_id: Option<String>,
     pub provider_name: Option<String>,
+    pub model: Option<String>,
     pub started_at: String,
     pub duration_ms: i64,
     pub status_code: Option<u16>,
     pub outcome: String,
     pub error: Option<String>,
     pub request_bytes: Option<u64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
     pub content_captured: bool,
 }
 

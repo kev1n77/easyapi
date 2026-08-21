@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -13,6 +14,34 @@ use crate::models::{HeaderPair, Provider, ProviderInput, RequestCapture, Request
 pub struct Database {
     conn: Mutex<Connection>,
     captures_dir: PathBuf,
+}
+
+fn ensure_request_log_columns(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM pragma_table_info('request_logs')")
+        .map_err(|e| e.to_string())?;
+    let existing = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (name, definition) in [
+        ("model", "TEXT"),
+        ("input_tokens", "INTEGER"),
+        ("output_tokens", "INTEGER"),
+        ("total_tokens", "INTEGER"),
+        ("cached_input_tokens", "INTEGER"),
+        ("reasoning_tokens", "INTEGER"),
+    ] {
+        if !existing.contains(name) {
+            conn.execute(
+                &format!("ALTER TABLE request_logs ADD COLUMN {name} {definition}"),
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 impl Database {
@@ -49,12 +78,18 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 provider_id TEXT,
                 provider_name TEXT,
+                model TEXT,
                 started_at TEXT NOT NULL,
                 duration_ms INTEGER NOT NULL,
                 status_code INTEGER,
                 outcome TEXT NOT NULL,
                 error TEXT,
-                request_bytes INTEGER
+                request_bytes INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                total_tokens INTEGER,
+                cached_input_tokens INTEGER,
+                reasoning_tokens INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_request_logs_started_at
@@ -76,6 +111,7 @@ impl Database {
             "#,
         )
         .map_err(|e| e.to_string())?;
+        ensure_request_log_columns(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             captures_dir,
@@ -201,18 +237,25 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO request_logs
-             (id, provider_id, provider_name, started_at, duration_ms, status_code, outcome, error, request_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, provider_id, provider_name, model, started_at, duration_ms, status_code, outcome, error, request_bytes,
+              input_tokens, output_tokens, total_tokens, cached_input_tokens, reasoning_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 log.id,
                 log.provider_id,
                 log.provider_name,
+                log.model,
                 log.started_at,
                 log.duration_ms,
                 log.status_code,
                 log.outcome,
                 log.error,
-                log.request_bytes
+                log.request_bytes,
+                log.input_tokens,
+                log.output_tokens,
+                log.total_tokens,
+                log.cached_input_tokens,
+                log.reasoning_tokens,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -226,8 +269,9 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, provider_id, provider_name, started_at, duration_ms,
-                        status_code, outcome, error, request_bytes,
+                "SELECT id, provider_id, provider_name, model, started_at, duration_ms,
+                        status_code, outcome, error, request_bytes, input_tokens, output_tokens,
+                        total_tokens, cached_input_tokens, reasoning_tokens,
                         EXISTS(SELECT 1 FROM request_captures WHERE request_id = request_logs.id)
                  FROM request_logs ORDER BY started_at DESC LIMIT ?1",
             )
@@ -238,13 +282,19 @@ impl Database {
                     id: row.get(0)?,
                     provider_id: row.get(1)?,
                     provider_name: row.get(2)?,
-                    started_at: row.get(3)?,
-                    duration_ms: row.get(4)?,
-                    status_code: row.get::<_, Option<u16>>(5)?,
-                    outcome: row.get(6)?,
-                    error: row.get(7)?,
-                    request_bytes: row.get(8)?,
-                    content_captured: row.get(9)?,
+                    model: row.get(3)?,
+                    started_at: row.get(4)?,
+                    duration_ms: row.get(5)?,
+                    status_code: row.get::<_, Option<u16>>(6)?,
+                    outcome: row.get(7)?,
+                    error: row.get(8)?,
+                    request_bytes: row.get(9)?,
+                    input_tokens: row.get(10)?,
+                    output_tokens: row.get(11)?,
+                    total_tokens: row.get(12)?,
+                    cached_input_tokens: row.get(13)?,
+                    reasoning_tokens: row.get(14)?,
+                    content_captured: row.get(15)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -612,12 +662,18 @@ mod tests {
             id: "capture-test".to_string(),
             provider_id: None,
             provider_name: None,
+            model: None,
             started_at: Utc::now().to_rfc3339(),
             duration_ms: 1,
             status_code: Some(200),
             outcome: "completed".to_string(),
             error: None,
             request_bytes: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
             content_captured: false,
         })
         .unwrap();
@@ -648,6 +704,54 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_existing_request_log_schema_for_usage_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE request_logs (
+                    id TEXT PRIMARY KEY,
+                    provider_id TEXT,
+                    provider_name TEXT,
+                    started_at TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    status_code INTEGER,
+                    outcome TEXT NOT NULL,
+                    error TEXT,
+                    request_bytes INTEGER
+                );",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        db.insert_request_log(&RequestLog {
+            id: "legacy-test".to_string(),
+            provider_id: None,
+            provider_name: Some("Legacy".to_string()),
+            model: Some("gpt-5".to_string()),
+            started_at: Utc::now().to_rfc3339(),
+            duration_ms: 1,
+            status_code: Some(200),
+            outcome: "completed".to_string(),
+            error: None,
+            request_bytes: None,
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            total_tokens: Some(30),
+            cached_input_tokens: Some(2),
+            reasoning_tokens: Some(3),
+            content_captured: false,
+        })
+        .unwrap();
+
+        let logs = db.list_request_logs(None).unwrap();
+        assert_eq!(logs[0].model.as_deref(), Some("gpt-5"));
+        assert_eq!(logs[0].total_tokens, Some(30));
+    }
+
+    #[test]
     fn clears_request_logs_and_cascades_content_records() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::open(&temp.path().join("test.sqlite3")).unwrap();
@@ -655,12 +759,18 @@ mod tests {
             id: "clear-test".to_string(),
             provider_id: None,
             provider_name: None,
+            model: None,
             started_at: Utc::now().to_rfc3339(),
             duration_ms: 1,
             status_code: Some(200),
             outcome: "completed".to_string(),
             error: None,
             request_bytes: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
             content_captured: false,
         })
         .unwrap();

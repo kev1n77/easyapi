@@ -2,7 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { api, AppStatus, CodexSetup, ContentCaptureStatus, HeaderPair, Provider, ProviderInput, ProviderTestResult, RequestCapture, RequestLog } from "./api";
 import "./App.css";
 
-type Page = "overview" | "providers" | "requests" | "setup";
+type Page = "overview" | "providers" | "requests" | "stats" | "setup";
 
 const emptyStatus: AppStatus = {
   proxyRunning: false,
@@ -16,6 +16,21 @@ function formatBytes(bytes?: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
   return `${(bytes / 1024 / 1024).toFixed(2)} MiB`;
+}
+
+function formatTokens(tokens?: number) {
+  return tokens == null ? "—" : new Intl.NumberFormat("zh-CN").format(tokens);
+}
+
+function formatPercent(value?: number) {
+  return value == null ? "—" : `${(value * 100).toFixed(1)}%`;
+}
+
+function dateInputValue(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function formatTime(value: string) {
@@ -108,6 +123,7 @@ export default function App() {
           <NavButton active={page === "overview"} icon="◫" label="概览" onClick={() => setPage("overview")} />
           <NavButton active={page === "providers"} icon="◉" label="Provider" onClick={() => setPage("providers")} />
           <NavButton active={page === "requests"} icon="≡" label="请求记录" onClick={() => { setPage("requests"); void refresh(); }} />
+          <NavButton active={page === "stats"} icon="▦" label="Token 统计" onClick={() => { setPage("stats"); void refresh(); }} />
           <NavButton active={page === "setup"} icon="⌘" label="Codex 配置" onClick={() => setPage("setup")} />
         </nav>
         <div className="sidebar-status">
@@ -123,6 +139,7 @@ export default function App() {
             {page === "overview" && <Overview status={status} active={active} providers={providers} logs={logs} onSwitch={switchProvider} onManage={() => setPage("providers")} />}
             {page === "providers" && <ProvidersPage providers={providers} onAdd={() => setEditing("new")} onEdit={setEditing} onSwitch={switchProvider} onDelete={removeProvider} notify={setNotice} />}
             {page === "requests" && <RequestsPage logs={logs} onRefresh={refresh} contentCapture={contentCapture} onCaptureEnabledChange={setContentCaptureEnabled} notify={setNotice} />}
+            {page === "stats" && <StatisticsPage logs={logs} />}
             {page === "setup" && <SetupPage setup={setup} />}
           </>
         )}
@@ -181,6 +198,91 @@ function Overview({ status, active, providers, logs, onSwitch, onManage }: {
 
 function Stat({ label, value, detail, danger }: { label: string; value: string; detail: string; danger?: boolean }) {
   return <div className={`stat-card ${danger ? "danger" : ""}`}><span>{label}</span><strong>{value}</strong><small title={detail}>{detail}</small></div>;
+}
+
+function StatisticsPage({ logs }: { logs: RequestLog[] }) {
+  const today = new Date();
+  const defaultFrom = new Date(today);
+  defaultFrom.setDate(defaultFrom.getDate() - 6);
+  const [fromDate, setFromDate] = useState(() => dateInputValue(defaultFrom));
+  const [toDate, setToDate] = useState(() => dateInputValue(today));
+  const [provider, setProvider] = useState("");
+  const [model, setModel] = useState("");
+
+  const providerOptions = useMemo(() => {
+    const options = new Map<string, string>();
+    for (const log of logs) {
+      const value = log.providerId ?? `name:${log.providerName ?? "unknown"}`;
+      options.set(value, log.providerName ?? "未选择");
+    }
+    return Array.from(options, ([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label));
+  }, [logs]);
+
+  const modelOptions = useMemo(() => {
+    const values = new Set<string>();
+    for (const log of logs) {
+      const providerKey = log.providerId ?? `name:${log.providerName ?? "unknown"}`;
+      if ((!provider || providerKey === provider) && log.model) values.add(log.model);
+    }
+    return Array.from(values).sort((a, b) => a.localeCompare(b));
+  }, [logs, provider]);
+
+  const filteredLogs = useMemo(() => {
+    const from = fromDate ? new Date(`${fromDate}T00:00:00`).getTime() : Number.NEGATIVE_INFINITY;
+    const to = toDate ? new Date(`${toDate}T23:59:59.999`).getTime() : Number.POSITIVE_INFINITY;
+    return logs.filter(log => {
+      const providerKey = log.providerId ?? `name:${log.providerName ?? "unknown"}`;
+      const timestamp = new Date(log.startedAt).getTime();
+      return timestamp >= from && timestamp <= to && (!provider || providerKey === provider) && (!model || log.model === model);
+    });
+  }, [logs, fromDate, toDate, provider, model]);
+
+  const totals = useMemo(() => {
+    const sum = (field: "inputTokens" | "outputTokens" | "cachedInputTokens" | "reasoningTokens") =>
+      filteredLogs.reduce((total, log) => total + (log[field] ?? 0), 0);
+    const input = sum("inputTokens");
+    const cached = sum("cachedInputTokens");
+    const usageRequests = filteredLogs.filter(log => log.inputTokens != null || log.outputTokens != null || log.totalTokens != null).length;
+    const cacheHitRate = input > 0 ? cached / input : undefined;
+    return {
+      input,
+      output: sum("outputTokens"),
+      cached,
+      reasoning: sum("reasoningTokens"),
+      cacheHitRate,
+      usageRequests,
+    };
+  }, [filteredLogs]);
+
+  function resetFilters() {
+    setFromDate(dateInputValue(defaultFrom));
+    setToDate(dateInputValue(today));
+    setProvider("");
+    setModel("");
+  }
+
+  return <section>
+    <PageHeader title="Token 统计" subtitle="按时间范围查看请求 token usage，并按 Provider 和模型筛选。" />
+    <div className="stats-filters">
+      <label className="stats-filter"><span>开始日期</span><input type="date" value={fromDate} onChange={event => setFromDate(event.target.value)} /></label>
+      <label className="stats-filter"><span>结束日期</span><input type="date" value={toDate} onChange={event => setToDate(event.target.value)} /></label>
+      <label className="stats-filter"><span>Provider</span><select value={provider} onChange={event => { setProvider(event.target.value); setModel(""); }}><option value="">全部 Provider</option>{providerOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+      <label className="stats-filter"><span>模型</span><select value={model} onChange={event => setModel(event.target.value)}><option value="">全部模型</option>{modelOptions.map(option => <option key={option} value={option}>{option}</option>)}</select></label>
+      <button className="secondary stats-reset" onClick={resetFilters}>重置</button>
+    </div>
+    <div className="stats-grid token-summary">
+      <Stat label="请求数" value={formatTokens(filteredLogs.length)} detail={`${formatTokens(totals.usageRequests)} 个请求包含 usage`} />
+      <Stat label="输入 Token" value={formatTokens(totals.input)} detail={`缓存输入 ${formatTokens(totals.cached)}`} />
+      <Stat label="输出 Token" value={formatTokens(totals.output)} detail={`推理输出 ${formatTokens(totals.reasoning)}`} />
+      <Stat label="缓存命中率" value={formatPercent(totals.cacheHitRate)} detail={`${formatTokens(totals.cached)} 个缓存输入 Token`} />
+    </div>
+    <div className="table-panel stats-table-panel">
+      <table><thead><tr><th>时间</th><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>缓存</th><th>缓存命中率</th><th>推理</th><th>状态</th></tr></thead>
+        <tbody>{filteredLogs.map(log => <tr key={log.id}><td>{formatTime(log.startedAt)}</td><td>{log.providerName ?? "—"}</td><td>{log.model ?? "—"}</td><td>{formatTokens(log.inputTokens)}</td><td>{formatTokens(log.outputTokens)}</td><td>{formatTokens(log.cachedInputTokens)}</td><td>{formatPercent(log.inputTokens != null && log.inputTokens > 0 && log.cachedInputTokens != null ? log.cachedInputTokens / log.inputTokens : undefined)}</td><td>{formatTokens(log.reasoningTokens)}</td><td><span className={`http-status ${log.statusCode && log.statusCode < 400 ? "good" : "bad"}`}>{log.statusCode ?? "ERR"}</span></td></tr>)}</tbody>
+      </table>
+      {filteredLogs.length === 0 && <div className="empty">当前筛选范围内暂无请求 usage</div>}
+    </div>
+  </section>;
 }
 
 function ProvidersPage({ providers, onAdd, onEdit, onSwitch, onDelete, notify }: {
