@@ -12,6 +12,8 @@ export type Provider = {
   updatedAt: string;
   active: boolean;
   hasApiKey: boolean;
+  authenticated: boolean;
+  authType: "api_key" | "codex_oauth";
 };
 
 export type ProviderInput = {
@@ -21,6 +23,7 @@ export type ProviderInput = {
   apiKey?: string;
   testModel: string;
   extraHeaders: HeaderPair[];
+  authType: "api_key" | "codex_oauth";
 };
 
 export type AppStatus = {
@@ -81,6 +84,9 @@ export type CodexSetup = {
   localToken: string;
 };
 
+export type DeviceCode = { deviceCode: string; userCode: string; verificationUri: string; expiresIn: number; interval: number };
+export type OAuthStatus = { authenticated: boolean; accountId?: string; email?: string; expiresAt?: number };
+
 export const api = {
   listProviders: () => invoke<Provider[]>("list_providers"),
   saveProvider: (input: ProviderInput) => invoke<Provider>("save_provider", { input }),
@@ -96,4 +102,8 @@ export const api = {
   clearRequestCaptures: () => invoke<void>("clear_request_captures"),
   clearRequestLogs: () => invoke<void>("clear_request_logs"),
   getCodexSetup: () => invoke<CodexSetup>("get_codex_setup"),
+  startCodexOAuthLogin: () => invoke<DeviceCode>("start_codex_oauth_login"),
+  pollCodexOAuthLogin: (deviceCode: string, userCode: string) => invoke<boolean>("poll_codex_oauth_login", { deviceCode, userCode }),
+  getCodexOAuthStatus: () => invoke<OAuthStatus>("get_codex_oauth_status"),
+  logoutCodexOAuth: () => invoke<void>("logout_codex_oauth"),
 };

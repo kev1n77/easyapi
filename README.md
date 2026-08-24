@@ -18,6 +18,8 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 - 本地代理 Bearer Token 验证
 - 系统托盘常驻；关闭窗口只会隐藏
 - 手动连接测试
+- Codex 官方 ChatGPT Plus/Pro 订阅 OAuth 登录，自动刷新 access token
+- 官方订阅也作为 EasyAPI 内部 Provider，可在不重启 Codex 的情况下切换
 - Codex 配置和 PowerShell 环境变量命令生成
 
 ## 明确不做的事情
@@ -86,11 +88,14 @@ pnpm tauri build
    - Base URL，例如 `https://api.example.com/v1`
    - API Key
    - 可选测试模型
+   - 官方 ChatGPT Plus/Pro 订阅可选择“ChatGPT 官方订阅 OAuth”，然后完成浏览器设备码登录
 3. 点击“切换”，激活该 Provider。
 4. 打开“Codex 配置”页面。
 5. 执行页面生成的 PowerShell 命令，设置 `EASYAPI_LOCAL_TOKEN` 用户环境变量。
 6. 将页面生成的 Provider 配置加入用户级 `~/.codex/config.toml`。
 7. 重启一次 Codex。以后切换上游不再需要重启 Codex。
+
+官方 OAuth 的凭据由 EasyAPI 单独保存并在请求时刷新；Codex 始终只看到 `easyapi` 这一个本地 Provider，因此切换到或离开官方订阅不会改变 Codex 的会话列表归属。
 
 示例配置：
 
@@ -209,6 +214,8 @@ SQLite 只保存：
 - 当前 Provider ID
 - 本地代理 Token
 - 请求状态、耗时、大小等脱敏元数据
+
+ChatGPT OAuth 的 access/refresh token 保存在应用数据目录的 `codex_oauth.json`，不写入 SQLite，也不会写入 Codex 的 `~/.codex/auth.json`。
 
 开启“记录内容”后，应用还会保存：
 

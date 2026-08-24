@@ -1,3 +1,4 @@
+mod codex_oauth;
 mod commands;
 mod models;
 mod proxy;
@@ -35,7 +36,8 @@ pub fn run() {
                 .map_err(|error| format!("无法监听 {listen_address}，端口可能已被占用: {error}"))?;
             std_listener.set_nonblocking(true)?;
 
-            let state = AppState::new(db, listen_address.clone())?;
+            let oauth = codex_oauth::CodexOAuthManager::new(app_data_dir.join("codex_oauth.json"))?;
+            let state = AppState::new(db, listen_address.clone(), oauth)?;
             app.manage(state.clone());
 
             let proxy_state = state.clone();
@@ -103,6 +105,10 @@ pub fn run() {
             commands::get_codex_setup,
             commands::test_provider,
             commands::list_provider_models,
+            commands::start_codex_oauth_login,
+            commands::poll_codex_oauth_login,
+            commands::get_codex_oauth_status,
+            commands::logout_codex_oauth,
         ])
         .run(tauri::generate_context!())
         .expect("error while running EasyAPI");

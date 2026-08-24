@@ -74,10 +74,19 @@ async fn proxy_models(
         url.push_str(query);
     }
 
-    let mut builder = state.http_client.get(url).header(
-        header::AUTHORIZATION,
-        format!("Bearer {}", provider.api_key()),
-    );
+    let (token, account_id) = match upstream_token(&state, &provider).await {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": {"message": error, "type": "authentication_error"}}),
+            )
+        }
+    };
+    let mut builder = state
+        .http_client
+        .get(url)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
     for (name, value) in &parts.headers {
         if should_forward_request_header(name) {
             builder = builder.header(name, value);
@@ -85,6 +94,12 @@ async fn proxy_models(
     }
     for (name, value) in &provider.headers {
         builder = builder.header(name, value);
+    }
+    if let Some(account_id) = account_id {
+        builder = builder
+            .header("chatgpt-account-id", account_id)
+            .header("originator", crate::codex_oauth::CODEX_OAUTH_ORIGINATOR)
+            .header("version", crate::codex_oauth::CODEX_OAUTH_CLIENT_VERSION);
     }
 
     let upstream = match builder.send().await {
@@ -194,10 +209,20 @@ async fn proxy_responses_endpoint(
     } else {
         provider.responses_url()
     };
-    let mut builder = state.http_client.post(upstream_url).header(
-        header::AUTHORIZATION,
-        format!("Bearer {}", provider.api_key()),
-    );
+    let (token, account_id) = match upstream_token(&state, &provider).await {
+        Ok(value) => value,
+        Err(error) => {
+            guard.fail(StatusCode::UNAUTHORIZED, &error);
+            return json_response(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": {"message": error, "type": "authentication_error"}}),
+            );
+        }
+    };
+    let mut builder = state
+        .http_client
+        .post(upstream_url)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
 
     for (name, value) in &parts.headers {
         if should_forward_request_header(name) {
@@ -206,6 +231,12 @@ async fn proxy_responses_endpoint(
     }
     for (name, value) in &provider.headers {
         builder = builder.header(name, value);
+    }
+    if let Some(account_id) = account_id {
+        builder = builder
+            .header("chatgpt-account-id", account_id)
+            .header("originator", crate::codex_oauth::CODEX_OAUTH_ORIGINATOR)
+            .header("version", crate::codex_oauth::CODEX_OAUTH_CLIENT_VERSION);
     }
 
     let mut incoming = body.into_data_stream();
@@ -337,6 +368,17 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
         return false;
     };
     token.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
+async fn upstream_token(
+    state: &AppState,
+    provider: &crate::state::ProviderRuntime,
+) -> Result<(String, Option<String>), String> {
+    if provider.uses_codex_oauth() {
+        let (token, account_id) = state.oauth.access_token().await?;
+        return Ok((token, (!account_id.is_empty()).then_some(account_id)));
+    }
+    Ok((provider.api_key().to_string(), None))
 }
 
 fn should_forward_request_header(name: &HeaderName) -> bool {
@@ -783,7 +825,12 @@ mod tests {
         let temp = tempdir().unwrap();
         let db =
             Arc::new(crate::storage::Database::open(&temp.path().join("test.sqlite3")).unwrap());
-        let state = crate::state::AppState::new(db, "127.0.0.1:8787".to_string()).unwrap();
+        let state = crate::state::AppState::new(
+            db,
+            "127.0.0.1:8787".to_string(),
+            crate::codex_oauth::CodexOAuthManager::new(temp.path().join("oauth.json")).unwrap(),
+        )
+        .unwrap();
         state.set_content_capture_enabled(true).unwrap();
         state
             .providers
@@ -794,6 +841,7 @@ mod tests {
                     base_url: format!("http://{upstream_address}/v1"),
                     test_model: "test".to_string(),
                     extra_headers: vec![],
+                    auth_type: crate::models::AUTH_TYPE_API_KEY.to_string(),
                     created_at: Utc::now().to_rfc3339(),
                     updated_at: Utc::now().to_rfc3339(),
                 },
@@ -890,7 +938,12 @@ mod tests {
         let temp = tempdir().unwrap();
         let db =
             Arc::new(crate::storage::Database::open(&temp.path().join("compact.sqlite3")).unwrap());
-        let state = crate::state::AppState::new(db, "127.0.0.1:8787".to_string()).unwrap();
+        let state = crate::state::AppState::new(
+            db,
+            "127.0.0.1:8787".to_string(),
+            crate::codex_oauth::CodexOAuthManager::new(temp.path().join("oauth.json")).unwrap(),
+        )
+        .unwrap();
         state
             .providers
             .set_active_for_test(crate::state::ProviderRuntime::new_for_test(
@@ -900,6 +953,7 @@ mod tests {
                     base_url: format!("http://{upstream_address}/v1"),
                     test_model: "test".to_string(),
                     extra_headers: vec![],
+                    auth_type: crate::models::AUTH_TYPE_API_KEY.to_string(),
                     created_at: Utc::now().to_rfc3339(),
                     updated_at: Utc::now().to_rfc3339(),
                 },
@@ -966,7 +1020,12 @@ mod tests {
         let temp = tempdir().unwrap();
         let db =
             Arc::new(crate::storage::Database::open(&temp.path().join("models.sqlite3")).unwrap());
-        let state = crate::state::AppState::new(db, "127.0.0.1:8787".to_string()).unwrap();
+        let state = crate::state::AppState::new(
+            db,
+            "127.0.0.1:8787".to_string(),
+            crate::codex_oauth::CodexOAuthManager::new(temp.path().join("oauth.json")).unwrap(),
+        )
+        .unwrap();
         state
             .providers
             .set_active_for_test(crate::state::ProviderRuntime::new_for_test(
@@ -976,6 +1035,7 @@ mod tests {
                     base_url: format!("http://{upstream_address}/v1"),
                     test_model: "test".to_string(),
                     extra_headers: vec![],
+                    auth_type: crate::models::AUTH_TYPE_API_KEY.to_string(),
                     created_at: Utc::now().to_rfc3339(),
                     updated_at: Utc::now().to_rfc3339(),
                 },
@@ -1031,7 +1091,12 @@ mod tests {
         let temp = tempdir().unwrap();
         let db =
             Arc::new(crate::storage::Database::open(&temp.path().join("large.sqlite3")).unwrap());
-        let state = crate::state::AppState::new(db, "127.0.0.1:8787".to_string()).unwrap();
+        let state = crate::state::AppState::new(
+            db,
+            "127.0.0.1:8787".to_string(),
+            crate::codex_oauth::CodexOAuthManager::new(temp.path().join("oauth.json")).unwrap(),
+        )
+        .unwrap();
         state
             .providers
             .set_active_for_test(crate::state::ProviderRuntime::new_for_test(
@@ -1041,6 +1106,7 @@ mod tests {
                     base_url: format!("http://{upstream_address}/v1"),
                     test_model: "test".to_string(),
                     extra_headers: vec![],
+                    auth_type: crate::models::AUTH_TYPE_API_KEY.to_string(),
                     created_at: Utc::now().to_rfc3339(),
                     updated_at: Utc::now().to_rfc3339(),
                 },

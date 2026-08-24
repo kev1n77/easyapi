@@ -1,5 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { api, AppStatus, CodexSetup, ContentCaptureStatus, HeaderPair, Provider, ProviderInput, ProviderTestResult, RequestCapture, RequestLog } from "./api";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { api, AppStatus, CodexSetup, ContentCaptureStatus, HeaderPair, Provider, ProviderInput, ProviderTestResult, RequestCapture, RequestLog, OAuthStatus } from "./api";
 import "./App.css";
 
 type Page = "overview" | "providers" | "requests" | "stats" | "setup";
@@ -50,6 +51,7 @@ export default function App() {
   const [logs, setLogs] = useState<RequestLog[]>([]);
   const [contentCapture, setContentCapture] = useState<ContentCaptureStatus>({ enabled: false });
   const [setup, setSetup] = useState<CodexSetup | null>(null);
+  const [oauth, setOauth] = useState<OAuthStatus | null>(null);
   const [editing, setEditing] = useState<Provider | "new" | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -63,6 +65,7 @@ export default function App() {
       setStatus(nextStatus);
       setLogs(nextLogs);
       setContentCapture(nextContentCapture);
+      setOauth(await api.getCodexOAuthStatus());
     } catch (error) {
       setNotice(errorText(error));
     } finally {
@@ -136,7 +139,7 @@ export default function App() {
         {notice && <div className="notice" onClick={() => setNotice(null)}>{notice}<button>×</button></div>}
         {loading ? <div className="empty">正在加载…</div> : (
           <>
-            {page === "overview" && <Overview status={status} active={active} providers={providers} logs={logs} onSwitch={switchProvider} onManage={() => setPage("providers")} />}
+            {page === "overview" && <Overview status={status} active={active} providers={providers} logs={logs} oauthAuthenticated={oauth?.authenticated ?? false} onSwitch={switchProvider} onManage={() => setPage("providers")} />}
             {page === "providers" && <ProvidersPage providers={providers} onAdd={() => setEditing("new")} onEdit={setEditing} onSwitch={switchProvider} onDelete={removeProvider} notify={setNotice} />}
             {page === "requests" && <RequestsPage logs={logs} onRefresh={refresh} contentCapture={contentCapture} onCaptureEnabledChange={setContentCaptureEnabled} notify={setNotice} />}
             {page === "stats" && <StatisticsPage logs={logs} />}
@@ -154,8 +157,8 @@ function NavButton({ active, icon, label, onClick }: { active: boolean; icon: st
   return <button className={`nav-button ${active ? "active" : ""}`} onClick={onClick}><span>{icon}</span>{label}</button>;
 }
 
-function Overview({ status, active, providers, logs, onSwitch, onManage }: {
-  status: AppStatus; active?: Provider; providers: Provider[]; logs: RequestLog[];
+function Overview({ status, active, providers, logs, oauthAuthenticated, onSwitch, onManage }: {
+  status: AppStatus; active?: Provider; providers: Provider[]; logs: RequestLog[]; oauthAuthenticated: boolean;
   onSwitch: (provider: Provider) => void; onManage: () => void;
 }) {
   return <section>
@@ -178,7 +181,7 @@ function Overview({ status, active, providers, logs, onSwitch, onManage }: {
         <div className="panel-title"><div><h3>快速切换</h3><p>切换只影响之后的新请求。</p></div></div>
         <div className="compact-list">
           {providers.length === 0 && <div className="empty small">还没有 Provider</div>}
-          {providers.map(provider => <button key={provider.id} className={`compact-provider ${provider.active ? "active" : ""}`} disabled={provider.active || !provider.hasApiKey} onClick={() => onSwitch(provider)}>
+          {providers.map(provider => <button key={provider.id} className={`compact-provider ${provider.active ? "active" : ""}`} disabled={provider.active || (!provider.hasApiKey && !(provider.authType === "codex_oauth" && oauthAuthenticated))} onClick={() => onSwitch(provider)}>
             <span className="provider-avatar">{provider.name.slice(0, 1).toUpperCase()}</span>
             <span><strong>{provider.name}</strong><small>{provider.baseUrl}</small></span>
             <em>{provider.active ? "使用中" : "切换"}</em>
@@ -291,6 +294,29 @@ function ProvidersPage({ providers, onAdd, onEdit, onSwitch, onDelete, notify }:
 }) {
   const [testing, setTesting] = useState<string | null>(null);
   const [results, setResults] = useState<Record<string, ProviderTestResult>>({});
+  const [oauth, setOauth] = useState<OAuthStatus | null>(null);
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [device, setDevice] = useState<{ deviceCode: string; userCode: string; verificationUri: string; interval: number } | null>(null);
+
+  useEffect(() => { void api.getCodexOAuthStatus().then(setOauth).catch(() => undefined); }, []);
+
+  async function loginOAuth() {
+    setOauthBusy(true);
+    try {
+      const next = await api.startCodexOAuthLogin();
+      setDevice(next);
+      await openUrl(next.verificationUri);
+      notify(`请在浏览器中输入设备码 ${next.userCode} 完成 ChatGPT 登录`);
+      let attempts = 0;
+      const poll = async () => {
+        if (attempts++ > Math.ceil(next.expiresIn / next.interval)) throw new Error("OAuth 登录已过期");
+        const done = await api.pollCodexOAuthLogin(next.deviceCode, next.userCode);
+        if (done) { setDevice(null); setOauth(await api.getCodexOAuthStatus()); notify("ChatGPT OAuth 登录成功"); setOauthBusy(false); return; }
+        window.setTimeout(() => void poll().catch(error => { setOauthBusy(false); notify(errorText(error)); }), next.interval * 1000);
+      };
+      window.setTimeout(() => void poll().catch(error => { setOauthBusy(false); notify(errorText(error)); }), next.interval * 1000);
+    } catch (error) { setOauthBusy(false); notify(errorText(error)); }
+  }
 
   async function test(provider: Provider) {
     setTesting(provider.id);
@@ -306,18 +332,19 @@ function ProvidersPage({ providers, onAdd, onEdit, onSwitch, onDelete, notify }:
   }
 
   return <section>
-    <PageHeader title="Provider" subtitle="每个 Provider 包含一个上游地址和独立 API Key。" action={<button className="primary" onClick={onAdd}>＋ 添加 Provider</button>} />
+    <PageHeader title="Provider" subtitle="每个 Provider 都在 EasyAPI 内部独立切换认证和上游。" action={<button className="primary" onClick={onAdd}>＋ 添加 Provider</button>} />
+    <div className="info-box"><strong>Codex 官方订阅</strong><p>{oauth?.authenticated ? `已登录 ${oauth.email ?? oauth.accountId ?? "ChatGPT 账号"}` : "OAuth 凭据由 EasyAPI 单独保存，Codex 仍只连接 easyapi Provider。"}</p><div className="card-actions"><button disabled={oauthBusy} onClick={() => void loginOAuth()}>{oauthBusy ? "登录处理中…" : oauth?.authenticated ? "重新登录" : "登录 ChatGPT"}</button>{oauth?.authenticated && <button className="delete" onClick={() => void api.logoutCodexOAuth().then(() => { setOauth({ authenticated: false }); notify("已退出 ChatGPT OAuth"); }).catch(error => notify(errorText(error)))}>退出登录</button>}</div>{device && <small>设备码：{device.userCode}，请完成浏览器授权后等待状态更新。</small>}</div>
     <div className="provider-grid">
       {providers.map(provider => {
         const result = results[provider.id];
         return <article className={`provider-card ${provider.active ? "active" : ""}`} key={provider.id}>
           <div className="provider-card-top">
             <span className="provider-avatar large">{provider.name.slice(0, 1).toUpperCase()}</span>
-            <div><h3>{provider.name}</h3><p>{provider.baseUrl}</p></div>
+            <div><h3>{provider.name}</h3><p>{provider.authType === "codex_oauth" ? "ChatGPT OAuth · chatgpt.com/backend-api/codex" : provider.baseUrl}</p></div>
             {provider.active && <span className="active-badge">使用中</span>}
           </div>
           <dl>
-            <div><dt>API Key</dt><dd>{provider.hasApiKey ? "已安全保存" : "未设置"}</dd></div>
+            <div><dt>认证</dt><dd>{provider.authType === "codex_oauth" ? (oauth?.authenticated ? "ChatGPT OAuth 已登录" : "需要登录") : (provider.hasApiKey ? "API Key 已安全保存" : "未设置")}</dd></div>
             <div><dt>测试模型</dt><dd>{provider.testModel || "未设置"}</dd></div>
             <div><dt>额外请求头</dt><dd>{provider.extraHeaders.length} 项</dd></div>
             {result && <div><dt>最近测试</dt><dd className={result.ok ? "success-text" : "error-text"}>{result.statusCode ?? "连接失败"} · {result.latencyMs} ms</dd></div>}
@@ -325,7 +352,7 @@ function ProvidersPage({ providers, onAdd, onEdit, onSwitch, onDelete, notify }:
           <div className="card-actions">
             <button disabled={testing === provider.id || !provider.testModel} onClick={() => void test(provider)}>{testing === provider.id ? "测试中…" : "测试"}</button>
             <button onClick={() => onEdit(provider)}>编辑</button>
-            {!provider.active && <button className="switch" disabled={!provider.hasApiKey} onClick={() => onSwitch(provider)}>切换</button>}
+            {!provider.active && <button className="switch" disabled={!provider.authenticated || (provider.authType === "codex_oauth" && !oauth?.authenticated)} onClick={() => onSwitch(provider)}>切换</button>}
             <button className="delete" onClick={() => onDelete(provider)}>删除</button>
           </div>
         </article>;
@@ -448,13 +475,14 @@ function ProviderDialog({ provider, onClose, onSaved }: { provider?: Provider; o
     apiKey: "",
     testModel: provider?.testModel ?? "",
     extraHeaders: provider?.extraHeaders ?? [],
+    authType: provider?.authType ?? "api_key",
   });
   const [saving, setSaving] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const valid = useMemo(() => form.name.trim() && form.baseUrl.trim() && (provider || form.apiKey?.trim()), [form, provider]);
+  const valid = useMemo(() => form.name.trim() && form.baseUrl.trim() && (form.authType === "codex_oauth" || provider || form.apiKey?.trim()), [form, provider]);
   async function submit(event: FormEvent) {
     event.preventDefault();
     setSaving(true); setError(null);
@@ -474,11 +502,12 @@ function ProviderDialog({ provider, onClose, onSaved }: { provider?: Provider; o
   }
   return <div className="dialog-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <form className="dialog" onSubmit={submit}>
-      <div className="dialog-header"><div><h2>{provider ? "编辑 Provider" : "添加 Provider"}</h2><p>API Key 将保存到 Windows Credential Manager。</p></div><button type="button" onClick={onClose}>×</button></div>
+      <div className="dialog-header"><div><h2>{provider ? "编辑 Provider" : "添加 Provider"}</h2><p>API Key 保存到 Windows Credential Manager；OAuth 凭据由 EasyAPI 单独保存。</p></div><button type="button" onClick={onClose}>×</button></div>
       {error && <div className="form-error">{error}</div>}
       <label><span>名称</span><input autoFocus value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="例如 API-A" /></label>
-      <label><span>Base URL</span><input value={form.baseUrl} onChange={e => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" /><small>EasyAPI 会在此地址后追加 /responses</small></label>
-      <label><span>{provider ? "替换 API Key（留空则不修改）" : "API Key"}</span><input type="password" value={form.apiKey} onChange={e => setForm({ ...form, apiKey: e.target.value })} placeholder={provider ? "保持现有 Key" : "sk-..."} autoComplete="off" /></label>
+      <label><span>认证方式</span><select value={form.authType} onChange={e => setForm({ ...form, authType: e.target.value as ProviderInput["authType"], baseUrl: e.target.value === "codex_oauth" ? "https://chatgpt.com/backend-api/codex" : form.baseUrl })}><option value="api_key">API Key</option><option value="codex_oauth">ChatGPT 官方订阅 OAuth</option></select></label>
+      <label><span>Base URL</span><input value={form.baseUrl} onChange={e => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" /><small>{form.authType === "codex_oauth" ? "官方 OAuth 固定使用 ChatGPT Codex backend。" : "EasyAPI 会在此地址后追加 /responses"}</small></label>
+      {form.authType === "api_key" && <label><span>{provider ? "替换 API Key（留空则不修改）" : "API Key"}</span><input type="password" value={form.apiKey} onChange={e => setForm({ ...form, apiKey: e.target.value })} placeholder={provider ? "保持现有 Key" : "sk-..."} autoComplete="off" /></label>}
       <label><span className="model-field-label">测试模型{provider && <button type="button" onClick={() => void loadModels()} disabled={loadingModels}>{loadingModels ? "获取中…" : "获取模型"}</button>}</span><input list="provider-models" value={form.testModel} onChange={e => setForm({ ...form, testModel: e.target.value })} placeholder="用于手动连接测试，可留空" />
         <datalist id="provider-models">{models.map(model => <option key={model} value={model} />)}</datalist>
       </label>

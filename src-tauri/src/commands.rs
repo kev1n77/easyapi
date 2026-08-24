@@ -7,6 +7,7 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::{
+    codex_oauth::{DeviceCode, OAuthStatus},
     models::{
         AppStatus, CodexSetup, ContentCaptureStatus, ProviderInput, ProviderTestResult,
         ProviderView, RequestCapture, RequestLog,
@@ -29,8 +30,10 @@ pub fn save_provider(
         .id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let is_new = state.db.get_provider(&id)?.is_none();
-    if is_new
+    let existing = state.db.get_provider(&id)?;
+    let is_new = existing.is_none();
+    if input.auth_type != crate::models::AUTH_TYPE_CODEX_OAUTH
+        && is_new
         && input
             .api_key
             .as_deref()
@@ -38,9 +41,22 @@ pub fn save_provider(
     {
         return Err("新增 Provider 时必须填写 API Key".to_string());
     }
+    if input.auth_type != crate::models::AUTH_TYPE_CODEX_OAUTH
+        && input
+            .api_key
+            .as_deref()
+            .is_none_or(|key| key.trim().is_empty())
+        && existing
+            .as_ref()
+            .is_none_or(|provider| provider.auth_type == crate::models::AUTH_TYPE_CODEX_OAUTH)
+    {
+        return Err("切换到 API Key 认证时必须填写 API Key".to_string());
+    }
 
     let provider = state.db.save_provider(&input, &id)?;
-    if let Some(api_key) = input
+    if input.auth_type == crate::models::AUTH_TYPE_CODEX_OAUTH {
+        delete_api_key(&id)?;
+    } else if let Some(api_key) = input
         .api_key
         .as_deref()
         .map(str::trim)
@@ -58,6 +74,7 @@ pub fn save_provider(
     Ok(ProviderView {
         active: state.providers.active_id().as_deref() == Some(id.as_str()),
         has_api_key,
+        authenticated: has_api_key || provider.auth_type == crate::models::AUTH_TYPE_CODEX_OAUTH,
         provider,
     })
 }
@@ -69,6 +86,34 @@ pub fn delete_provider(state: State<'_, Arc<AppState>>, id: String) -> Result<()
     }
     state.db.delete_provider(&id)?;
     delete_api_key(&id)
+}
+
+#[tauri::command]
+pub async fn start_codex_oauth_login(
+    state: State<'_, Arc<AppState>>,
+) -> Result<DeviceCode, String> {
+    state.oauth.start_device_flow().await
+}
+
+#[tauri::command]
+pub async fn poll_codex_oauth_login(
+    state: State<'_, Arc<AppState>>,
+    device_code: String,
+    user_code: String,
+) -> Result<bool, String> {
+    state.oauth.poll_device_flow(&device_code, &user_code).await
+}
+
+#[tauri::command]
+pub async fn get_codex_oauth_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<OAuthStatus, String> {
+    Ok(state.oauth.status().await)
+}
+
+#[tauri::command]
+pub async fn logout_codex_oauth(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.oauth.logout().await
 }
 
 #[tauri::command]
@@ -162,10 +207,19 @@ pub async fn test_provider(
         return Err("请先填写测试模型".to_string());
     }
     let started = Instant::now();
+    let (token, account_id) = if provider.uses_codex_oauth() {
+        state
+            .oauth
+            .access_token()
+            .await
+            .map(|(token, id)| (token, Some(id)))?
+    } else {
+        (provider.api_key().to_string(), None)
+    };
     let mut request = state
         .http_client
         .post(provider.responses_url())
-        .bearer_auth(provider.api_key())
+        .bearer_auth(token)
         .json(&serde_json::json!({
             "model": provider.provider.test_model,
             "input": "Reply with OK.",
@@ -174,6 +228,12 @@ pub async fn test_provider(
         }));
     for (name, value) in &provider.headers {
         request = request.header(name, value);
+    }
+    if let Some(account_id) = account_id {
+        request = request
+            .header("chatgpt-account-id", account_id)
+            .header("originator", crate::codex_oauth::CODEX_OAUTH_ORIGINATOR)
+            .header("version", crate::codex_oauth::CODEX_OAUTH_CLIENT_VERSION);
     }
     match request.send().await {
         Ok(response) => {
@@ -217,12 +277,27 @@ pub async fn list_provider_models(
     id: String,
 ) -> Result<Vec<String>, String> {
     let provider = state.providers.load_runtime(&id)?;
+    let (token, account_id) = if provider.uses_codex_oauth() {
+        state
+            .oauth
+            .access_token()
+            .await
+            .map(|(token, id)| (token, Some(id)))?
+    } else {
+        (provider.api_key().to_string(), None)
+    };
     let mut request = state
         .http_client
         .get(provider.models_url())
-        .bearer_auth(provider.api_key());
+        .bearer_auth(token);
     for (name, value) in &provider.headers {
         request = request.header(name, value);
+    }
+    if let Some(account_id) = account_id {
+        request = request
+            .header("chatgpt-account-id", account_id)
+            .header("originator", crate::codex_oauth::CODEX_OAUTH_ORIGINATOR)
+            .header("version", crate::codex_oauth::CODEX_OAUTH_CLIENT_VERSION);
     }
 
     let response = request.send().await.map_err(|error| {
@@ -269,6 +344,12 @@ fn validate_provider_input(input: &mut ProviderInput) -> Result<(), String> {
     input.name = input.name.trim().to_string();
     input.base_url = input.base_url.trim().trim_end_matches('/').to_string();
     input.test_model = input.test_model.trim().to_string();
+    if !matches!(
+        input.auth_type.as_str(),
+        crate::models::AUTH_TYPE_API_KEY | crate::models::AUTH_TYPE_CODEX_OAUTH
+    ) {
+        return Err("认证类型无效".to_string());
+    }
     if input.name.is_empty() {
         return Err("Provider 名称不能为空".to_string());
     }
@@ -300,6 +381,9 @@ fn validate_provider_input(input: &mut ProviderInput) -> Result<(), String> {
                     | "te"
                     | "trailer"
                     | "upgrade"
+                    | "chatgpt-account-id"
+                    | "originator"
+                    | "version"
             )
         {
             return Err(format!("不允许自定义请求头: {}", pair.name));
@@ -360,6 +444,7 @@ mod tests {
             api_key: Some("key".to_string()),
             test_model: " model ".to_string(),
             extra_headers: vec![],
+            auth_type: crate::models::AUTH_TYPE_API_KEY.to_string(),
         };
         validate_provider_input(&mut input).unwrap();
         assert_eq!(input.name, "Test");
@@ -379,6 +464,7 @@ mod tests {
                 name: "Authorization".to_string(),
                 value: "bad".to_string(),
             }],
+            auth_type: crate::models::AUTH_TYPE_API_KEY.to_string(),
         };
         assert!(validate_provider_input(&mut input).is_err());
     }

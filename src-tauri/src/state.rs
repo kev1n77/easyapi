@@ -8,6 +8,7 @@ use keyring::Entry;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::{
+    codex_oauth::CodexOAuthManager,
     models::{AppStatus, Provider, ProviderView, RequestLog},
     storage::{CaptureData, ContentCapture, Database},
 };
@@ -19,20 +20,30 @@ const CONTENT_CAPTURE_ENABLED_SETTING: &str = "content_capture_enabled";
 
 pub struct ProviderRuntime {
     pub provider: Provider,
-    api_key: String,
+    api_key: Option<String>,
     pub headers: HeaderMap,
 }
 
 impl ProviderRuntime {
     pub fn api_key(&self) -> &str {
-        &self.api_key
+        self.api_key.as_deref().unwrap_or_default()
+    }
+
+    pub fn uses_codex_oauth(&self) -> bool {
+        self.provider.auth_type == crate::models::AUTH_TYPE_CODEX_OAUTH
     }
 
     pub fn responses_url(&self) -> String {
+        if self.uses_codex_oauth() {
+            return format!("{}/responses", crate::codex_oauth::CODEX_BASE_URL);
+        }
         format!("{}/responses", self.provider.base_url.trim_end_matches('/'))
     }
 
     pub fn responses_compact_url(&self) -> String {
+        if self.uses_codex_oauth() {
+            return format!("{}/responses/compact", crate::codex_oauth::CODEX_BASE_URL);
+        }
         format!(
             "{}/responses/compact",
             self.provider.base_url.trim_end_matches('/')
@@ -40,6 +51,9 @@ impl ProviderRuntime {
     }
 
     pub fn models_url(&self) -> String {
+        if self.uses_codex_oauth() {
+            return format!("{}/models", crate::codex_oauth::CODEX_BASE_URL);
+        }
         format!("{}/models", self.provider.base_url.trim_end_matches('/'))
     }
 }
@@ -93,6 +107,8 @@ impl ProviderManager {
                 ProviderView {
                     active: active_id.as_deref() == Some(provider.id.as_str()),
                     has_api_key,
+                    authenticated: has_api_key
+                        || provider.auth_type == crate::models::AUTH_TYPE_CODEX_OAUTH,
                     provider,
                 }
             })
@@ -124,12 +140,17 @@ impl ProviderManager {
             .db
             .get_provider(id)?
             .ok_or_else(|| "Provider 不存在".to_string())?;
-        let api_key = credential_entry(id)?
-            .get_password()
-            .map_err(|e| format!("无法读取 API Key: {e}"))?;
-        if api_key.trim().is_empty() {
-            return Err("API Key 为空".to_string());
-        }
+        let api_key = if provider.auth_type == crate::models::AUTH_TYPE_CODEX_OAUTH {
+            None
+        } else {
+            let value = credential_entry(id)?
+                .get_password()
+                .map_err(|e| format!("无法读取 API Key: {e}"))?;
+            if value.trim().is_empty() {
+                return Err("API Key 为空".to_string());
+            }
+            Some(value)
+        };
         let mut headers = HeaderMap::new();
         for pair in &provider.extra_headers {
             let name = HeaderName::from_bytes(pair.name.trim().as_bytes())
@@ -215,12 +236,17 @@ pub struct AppState {
     pub stats: Arc<RuntimeStats>,
     pub http_client: reqwest::Client,
     pub local_token: String,
+    pub oauth: Arc<CodexOAuthManager>,
     pub listen_address: String,
     content_capture_enabled: AtomicBool,
 }
 
 impl AppState {
-    pub fn new(db: Arc<Database>, listen_address: String) -> Result<Arc<Self>, String> {
+    pub fn new(
+        db: Arc<Database>,
+        listen_address: String,
+        oauth: Arc<CodexOAuthManager>,
+    ) -> Result<Arc<Self>, String> {
         let providers = Arc::new(ProviderManager::new(db.clone())?);
         let local_token = match db.get_setting(LOCAL_TOKEN_SETTING)? {
             Some(token) if !token.is_empty() => token,
@@ -243,6 +269,7 @@ impl AppState {
             stats: Arc::new(RuntimeStats::new()),
             http_client,
             local_token,
+            oauth,
             listen_address,
             content_capture_enabled: AtomicBool::new(content_capture_enabled),
         }))
@@ -290,7 +317,7 @@ impl ProviderRuntime {
     pub fn new_for_test(provider: Provider, api_key: String) -> Self {
         Self {
             provider,
-            api_key,
+            api_key: Some(api_key),
             headers: HeaderMap::new(),
         }
     }
@@ -302,5 +329,40 @@ impl ProviderManager {
         let id = runtime.provider.id.clone();
         self.active.store(Some(Arc::new(runtime)));
         *self.active_id.write().expect("active id lock") = Some(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oauth_provider() -> Provider {
+        Provider {
+            id: "official".to_string(),
+            name: "ChatGPT".to_string(),
+            base_url: "https://ignored.example".to_string(),
+            test_model: "gpt-5-codex".to_string(),
+            extra_headers: vec![],
+            auth_type: crate::models::AUTH_TYPE_CODEX_OAUTH.to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn codex_oauth_provider_uses_official_endpoints() {
+        let runtime = ProviderRuntime::new_for_test(oauth_provider(), String::new());
+        assert_eq!(
+            runtime.responses_url(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            runtime.responses_compact_url(),
+            "https://chatgpt.com/backend-api/codex/responses/compact"
+        );
+        assert_eq!(
+            runtime.models_url(),
+            "https://chatgpt.com/backend-api/codex/models"
+        );
     }
 }

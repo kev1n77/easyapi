@@ -8,6 +8,7 @@ pub struct Provider {
     pub base_url: String,
     pub test_model: String,
     pub extra_headers: Vec<HeaderPair>,
+    pub auth_type: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -30,6 +31,8 @@ pub struct ProviderInput {
     pub test_model: String,
     #[serde(default)]
     pub extra_headers: Vec<HeaderPair>,
+    #[serde(default = "default_auth_type")]
+    pub auth_type: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,6 +42,14 @@ pub struct ProviderView {
     pub provider: Provider,
     pub active: bool,
     pub has_api_key: bool,
+    pub authenticated: bool,
+}
+
+pub const AUTH_TYPE_API_KEY: &str = "api_key";
+pub const AUTH_TYPE_CODEX_OAUTH: &str = "codex_oauth";
+
+fn default_auth_type() -> String {
+    AUTH_TYPE_API_KEY.to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]

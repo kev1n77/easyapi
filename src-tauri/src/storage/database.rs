@@ -44,6 +44,25 @@ fn ensure_request_log_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_provider_columns(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM pragma_table_info('providers')")
+        .map_err(|e| e.to_string())?;
+    let existing = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if !existing.contains("auth_type") {
+        conn.execute(
+            "ALTER TABLE providers ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'api_key'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
@@ -66,7 +85,8 @@ impl Database {
                 test_model TEXT NOT NULL DEFAULT '',
                 extra_headers_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                auth_type TEXT NOT NULL DEFAULT 'api_key'
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -111,6 +131,7 @@ impl Database {
             "#,
         )
         .map_err(|e| e.to_string())?;
+        ensure_provider_columns(&conn)?;
         ensure_request_log_columns(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -122,7 +143,7 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, base_url, test_model, extra_headers_json, created_at, updated_at
+                "SELECT id, name, base_url, test_model, extra_headers_json, created_at, updated_at, auth_type
                  FROM providers ORDER BY created_at ASC",
             )
             .map_err(|e| e.to_string())?;
@@ -139,6 +160,7 @@ impl Database {
                     extra_headers: headers,
                     created_at: row.get(5)?,
                     updated_at: row.get(6)?,
+                    auth_type: row.get(7)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -149,7 +171,7 @@ impl Database {
     pub fn get_provider(&self, id: &str) -> Result<Option<Provider>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT id, name, base_url, test_model, extra_headers_json, created_at, updated_at
+            "SELECT id, name, base_url, test_model, extra_headers_json, created_at, updated_at, auth_type
              FROM providers WHERE id = ?1",
             [id],
             |row| {
@@ -162,6 +184,7 @@ impl Database {
                     extra_headers: serde_json::from_str(&headers_json).unwrap_or_default(),
                     created_at: row.get(5)?,
                     updated_at: row.get(6)?,
+                    auth_type: row.get(7)?,
                 })
             },
         )
@@ -183,15 +206,16 @@ impl Database {
             .map_err(|e| e.to_string())?;
         let created_at = created_at.unwrap_or_else(|| now.clone());
         conn.execute(
-            "INSERT INTO providers (id, name, base_url, test_model, extra_headers_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO providers (id, name, base_url, test_model, extra_headers_json, created_at, updated_at, auth_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 base_url = excluded.base_url,
                 test_model = excluded.test_model,
                 extra_headers_json = excluded.extra_headers_json,
-                updated_at = excluded.updated_at",
-            params![id, input.name, input.base_url, input.test_model, headers, created_at, now],
+                updated_at = excluded.updated_at,
+                auth_type = excluded.auth_type",
+            params![id, input.name, input.base_url, input.test_model, headers, created_at, now, input.auth_type],
         )
         .map_err(|e| e.to_string())?;
         drop(conn);
