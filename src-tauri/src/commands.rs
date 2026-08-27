@@ -216,16 +216,21 @@ pub async fn test_provider(
     } else {
         (provider.api_key().to_string(), None)
     };
+    let mut request_body = serde_json::json!({
+        "model": provider.provider.test_model,
+        "input": "Reply with OK.",
+        "stream": false
+    });
+    if provider.uses_codex_oauth() {
+        request_body["store"] = serde_json::json!(false);
+    } else {
+        request_body["max_output_tokens"] = serde_json::json!(16);
+    }
     let mut request = state
         .http_client
         .post(provider.responses_url())
         .bearer_auth(token)
-        .json(&serde_json::json!({
-            "model": provider.provider.test_model,
-            "input": "Reply with OK.",
-            "max_output_tokens": 16,
-            "stream": false
-        }));
+        .json(&request_body);
     for (name, value) in &provider.headers {
         request = request.header(name, value);
     }

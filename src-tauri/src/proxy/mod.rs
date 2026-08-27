@@ -6,7 +6,7 @@ use std::{
 
 use async_stream::stream;
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
     http::{header, HeaderMap, HeaderName, Request, Response, StatusCode},
     routing::{get, post},
@@ -209,6 +209,7 @@ async fn proxy_responses_endpoint(
     } else {
         provider.responses_url()
     };
+    let normalize_codex_request = provider.uses_codex_oauth() && !compact;
     let (token, account_id) = match upstream_token(&state, &provider).await {
         Ok(value) => value,
         Err(error) => {
@@ -225,7 +226,7 @@ async fn proxy_responses_endpoint(
         .header(header::AUTHORIZATION, format!("Bearer {token}"));
 
     for (name, value) in &parts.headers {
-        if should_forward_request_header(name) {
+        if should_forward_request_header_for_body(name, normalize_codex_request) {
             builder = builder.header(name, value);
         }
     }
@@ -244,6 +245,7 @@ async fn proxy_responses_endpoint(
     let model_extractor_for_stream = model_extractor.clone();
     let request_capture = guard.content_capture();
     let upload_stream = stream! {
+        let mut codex_normalizer = normalize_codex_request.then(CodexRequestNormalizer::default);
         loop {
             match timeout(UPLOAD_IDLE_TIMEOUT, incoming.next()).await {
                 Ok(Some(Ok(bytes))) => {
@@ -253,7 +255,14 @@ async fn proxy_responses_endpoint(
                     if let Some(capture) = &request_capture {
                         capture.write_request(&bytes);
                     }
-                    yield Ok::<_, io::Error>(bytes);
+                    if let Some(normalizer) = &mut codex_normalizer {
+                        let normalized = normalizer.observe(&bytes);
+                        if !normalized.is_empty() {
+                            yield Ok::<_, io::Error>(Bytes::from(normalized));
+                        }
+                    } else {
+                        yield Ok::<_, io::Error>(bytes);
+                    }
                 }
                 Ok(Some(Err(error))) => {
                     yield Err(io::Error::other(error));
@@ -396,6 +405,10 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
     )
 }
 
+fn should_forward_request_header_for_body(name: &HeaderName, body_rewritten: bool) -> bool {
+    should_forward_request_header(name) && !(body_rewritten && name == header::CONTENT_LENGTH)
+}
+
 fn should_forward_response_header(name: &HeaderName) -> bool {
     !matches!(
         name.as_str().to_ascii_lowercase().as_str(),
@@ -435,6 +448,215 @@ fn sanitized_reqwest_error(error: &reqwest::Error) -> String {
 
 const REQUEST_MODEL_BUFFER_LIMIT: usize = 64 * 1024;
 const USAGE_SCAN_BUFFER_LIMIT: usize = 4 * 1024;
+
+#[derive(Default)]
+struct CodexRequestNormalizer {
+    state: CodexRequestState,
+    separator: Vec<u8>,
+    member_prefix: Vec<u8>,
+    key_literal: Vec<u8>,
+    key_escaped: bool,
+    dropping_member: bool,
+    emitted_member: bool,
+    value_kind: JsonValueKind,
+    value_depth: usize,
+    value_in_string: bool,
+    value_escaped: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+enum CodexRequestState {
+    #[default]
+    BeforeRoot,
+    BetweenMembers,
+    Key,
+    AfterKey,
+    Value,
+    AfterValue,
+    Done,
+}
+
+#[derive(Clone, Copy, Default)]
+enum JsonValueKind {
+    #[default]
+    Unknown,
+    Primitive,
+    String,
+    Container,
+}
+
+impl CodexRequestNormalizer {
+    fn observe(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            match self.state {
+                CodexRequestState::BeforeRoot => {
+                    output.push(byte);
+                    if byte == b'{' {
+                        self.state = CodexRequestState::BetweenMembers;
+                    }
+                }
+                CodexRequestState::BetweenMembers => {
+                    self.observe_between_members(byte, &mut output)
+                }
+                CodexRequestState::Key => self.observe_key(byte),
+                CodexRequestState::AfterKey => self.observe_after_key(byte, &mut output),
+                CodexRequestState::Value => self.observe_value(byte, &mut output),
+                CodexRequestState::AfterValue => self.observe_after_value(byte, &mut output),
+                CodexRequestState::Done => output.push(byte),
+            }
+        }
+        output
+    }
+
+    fn observe_between_members(&mut self, byte: u8, output: &mut Vec<u8>) {
+        match byte {
+            b'"' => {
+                self.member_prefix.push(byte);
+                self.key_literal.push(byte);
+                self.key_escaped = false;
+                self.state = CodexRequestState::Key;
+            }
+            b'}' => self.finish_root(output),
+            _ => self.separator.push(byte),
+        }
+    }
+
+    fn observe_key(&mut self, byte: u8) {
+        self.member_prefix.push(byte);
+        self.key_literal.push(byte);
+        match (byte, self.key_escaped) {
+            (b'"', false) => self.state = CodexRequestState::AfterKey,
+            (b'\\', false) => self.key_escaped = true,
+            _ => self.key_escaped = false,
+        }
+    }
+
+    fn observe_after_key(&mut self, byte: u8, output: &mut Vec<u8>) {
+        self.member_prefix.push(byte);
+        if byte != b':' {
+            return;
+        }
+
+        let key = serde_json::from_slice::<String>(&self.key_literal).ok();
+        self.dropping_member = key
+            .as_deref()
+            .is_some_and(|key| matches!(key, "max_output_tokens" | "store"));
+        if !self.dropping_member {
+            self.flush_separator(output);
+            output.extend_from_slice(&self.member_prefix);
+            self.emitted_member = true;
+        }
+        self.separator.clear();
+        self.member_prefix.clear();
+        self.key_literal.clear();
+        self.value_kind = JsonValueKind::Unknown;
+        self.value_depth = 0;
+        self.value_in_string = false;
+        self.value_escaped = false;
+        self.state = CodexRequestState::Value;
+    }
+
+    fn observe_value(&mut self, byte: u8, output: &mut Vec<u8>) {
+        match self.value_kind {
+            JsonValueKind::Unknown => {
+                if byte.is_ascii_whitespace() {
+                    self.write_value_byte(byte, output);
+                    return;
+                }
+                self.value_kind = match byte {
+                    b'"' => JsonValueKind::String,
+                    b'{' | b'[' => JsonValueKind::Container,
+                    _ => JsonValueKind::Primitive,
+                };
+                if matches!(self.value_kind, JsonValueKind::Container) {
+                    self.value_depth = 1;
+                }
+                self.write_value_byte(byte, output);
+            }
+            JsonValueKind::Primitive => match byte {
+                b',' => self.begin_next_member(),
+                b'}' => self.finish_root(output),
+                _ if byte.is_ascii_whitespace() => {
+                    self.write_value_byte(byte, output);
+                    self.state = CodexRequestState::AfterValue;
+                }
+                _ => self.write_value_byte(byte, output),
+            },
+            JsonValueKind::String => {
+                self.write_value_byte(byte, output);
+                match (byte, self.value_escaped) {
+                    (b'"', false) => self.state = CodexRequestState::AfterValue,
+                    (b'\\', false) => self.value_escaped = true,
+                    _ => self.value_escaped = false,
+                }
+            }
+            JsonValueKind::Container => {
+                self.write_value_byte(byte, output);
+                if self.value_in_string {
+                    match (byte, self.value_escaped) {
+                        (b'"', false) => self.value_in_string = false,
+                        (b'\\', false) => self.value_escaped = true,
+                        _ => self.value_escaped = false,
+                    }
+                    return;
+                }
+
+                match byte {
+                    b'"' => self.value_in_string = true,
+                    b'{' | b'[' => self.value_depth += 1,
+                    b'}' | b']' => {
+                        self.value_depth = self.value_depth.saturating_sub(1);
+                        if self.value_depth == 0 {
+                            self.state = CodexRequestState::AfterValue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn observe_after_value(&mut self, byte: u8, output: &mut Vec<u8>) {
+        match byte {
+            b',' => self.begin_next_member(),
+            b'}' => self.finish_root(output),
+            _ => self.write_value_byte(byte, output),
+        }
+    }
+
+    fn write_value_byte(&self, byte: u8, output: &mut Vec<u8>) {
+        if !self.dropping_member {
+            output.push(byte);
+        }
+    }
+
+    fn begin_next_member(&mut self) {
+        self.separator.clear();
+        self.separator.push(b',');
+        self.state = CodexRequestState::BetweenMembers;
+    }
+
+    fn flush_separator(&self, output: &mut Vec<u8>) {
+        if self.emitted_member {
+            output.extend_from_slice(&self.separator);
+            return;
+        }
+        output.extend(self.separator.iter().copied().filter(|byte| *byte != b','));
+    }
+
+    fn finish_root(&mut self, output: &mut Vec<u8>) {
+        if matches!(self.state, CodexRequestState::BetweenMembers) {
+            output.extend(self.separator.iter().copied().filter(|byte| *byte != b','));
+        }
+        if self.emitted_member {
+            output.push(b',');
+        }
+        output.extend_from_slice(br#""store":false}"#);
+        self.separator.clear();
+        self.state = CodexRequestState::Done;
+    }
+}
 
 #[derive(Default)]
 struct RequestModelExtractor {
@@ -738,6 +960,82 @@ mod tests {
         assert!(!should_forward_request_header(&header::CONNECTION));
         assert!(should_forward_request_header(&header::CONTENT_TYPE));
         assert!(!should_forward_response_header(&header::TRANSFER_ENCODING));
+    }
+
+    #[test]
+    fn codex_body_rewrite_drops_the_original_content_length() {
+        assert!(should_forward_request_header_for_body(
+            &header::CONTENT_LENGTH,
+            false
+        ));
+        assert!(!should_forward_request_header_for_body(
+            &header::CONTENT_LENGTH,
+            true
+        ));
+    }
+
+    #[test]
+    fn normalizes_codex_request_fields_across_chunk_boundaries() {
+        let request = br#"{
+            "model":"gpt-5",
+            "input":[{"role":"user","content":"keep max_output_tokens and store here"}],
+            "max_output_tokens":512,
+            "store":true,
+            "stream":true
+        }"#;
+        let expected = serde_json::json!({
+            "model": "gpt-5",
+            "input": [{"role": "user", "content": "keep max_output_tokens and store here"}],
+            "store": false,
+            "stream": true
+        });
+
+        for chunk_size in 1..=request.len() {
+            let mut normalizer = CodexRequestNormalizer::default();
+            let mut normalized = Vec::new();
+            for chunk in request.chunks(chunk_size) {
+                normalized.extend(normalizer.observe(chunk));
+            }
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&normalized).unwrap(),
+                expected,
+                "chunk size {chunk_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_first_middle_last_and_missing_codex_fields() {
+        let cases = [
+            br#"{"max_output_tokens":128,"model":"gpt-5","store":true}"#.as_slice(),
+            br#"{"model":"gpt-5","store":null,"stream":true,"max_output_tokens":128}"#.as_slice(),
+            br#"{"model":"gpt-5","max_output_tokens":128}"#.as_slice(),
+            br#"{}"#.as_slice(),
+        ];
+
+        for request in cases {
+            let mut normalizer = CodexRequestNormalizer::default();
+            let normalized = request
+                .iter()
+                .flat_map(|byte| normalizer.observe(std::slice::from_ref(byte)))
+                .collect::<Vec<_>>();
+            let value = serde_json::from_slice::<serde_json::Value>(&normalized).unwrap();
+            assert_eq!(value["store"], false);
+            assert!(value.get("max_output_tokens").is_none());
+        }
+    }
+
+    #[test]
+    fn preserves_nested_fields_with_codex_restricted_names() {
+        let request = br#"{"input":{"max_output_tokens":64,"store":true},"max_output_tokens":256}"#;
+        let mut normalizer = CodexRequestNormalizer::default();
+        let normalized = normalizer.observe(request);
+        let value = serde_json::from_slice::<serde_json::Value>(&normalized).unwrap();
+
+        assert_eq!(value["input"]["max_output_tokens"], 64);
+        assert_eq!(value["input"]["store"], true);
+        assert_eq!(value["store"], false);
+        assert!(value.get("max_output_tokens").is_none());
     }
 
     #[test]

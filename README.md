@@ -20,6 +20,7 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 - 手动连接测试
 - Codex 官方 ChatGPT Plus/Pro 订阅 OAuth 登录，自动刷新 access token
 - 官方订阅也作为 EasyAPI 内部 Provider，可在不重启 Codex 的情况下切换
+- 官方订阅请求会流式兼容 ChatGPT Codex 后端：移除顶层 `max_output_tokens`，并强制使用 `store: false`
 - Codex 配置和 PowerShell 环境变量命令生成
 
 ## 明确不做的事情
@@ -130,6 +131,7 @@ model = "your-model-name"
 ```text
 Codex request body chunk
     -> EasyAPI
+    -> Codex OAuth 请求按顶层字段流式规范化（普通 Provider 原样透传）
     -> Reqwest streaming body
     -> active upstream
 ```
