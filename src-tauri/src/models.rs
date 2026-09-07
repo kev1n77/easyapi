@@ -93,6 +93,12 @@ pub struct ContentCaptureStatus {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProxySettings {
+    pub upstream_connect_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RequestCapture {
     pub request_content_type: Option<String>,
     pub response_content_type: Option<String>,

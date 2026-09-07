@@ -3,6 +3,7 @@ use std::sync::{
     Arc, RwLock,
 };
 
+use arc_swap::ArcSwap;
 use arc_swap::ArcSwapOption;
 use keyring::Entry;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -17,6 +18,10 @@ const KEYRING_SERVICE: &str = "easyapi";
 const ACTIVE_PROVIDER_SETTING: &str = "active_provider_id";
 const LOCAL_TOKEN_SETTING: &str = "local_token";
 const CONTENT_CAPTURE_ENABLED_SETTING: &str = "content_capture_enabled";
+const UPSTREAM_CONNECT_TIMEOUT_SETTING: &str = "upstream_connect_timeout_seconds";
+pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 15;
+pub const MIN_UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 1;
+pub const MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 300;
 
 pub struct ProviderRuntime {
     pub provider: Provider,
@@ -234,7 +239,8 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub providers: Arc<ProviderManager>,
     pub stats: Arc<RuntimeStats>,
-    pub http_client: reqwest::Client,
+    http_client: ArcSwap<reqwest::Client>,
+    upstream_connect_timeout_seconds: AtomicU64,
     pub local_token: String,
     pub oauth: Arc<CodexOAuthManager>,
     pub listen_address: String,
@@ -256,18 +262,23 @@ impl AppState {
                 token
             }
         };
-        let http_client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let upstream_connect_timeout_seconds = db
+            .get_setting(UPSTREAM_CONNECT_TIMEOUT_SETTING)?
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| {
+                (MIN_UPSTREAM_CONNECT_TIMEOUT_SECONDS..=MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS)
+                    .contains(value)
+            })
+            .unwrap_or(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECONDS);
+        let http_client = build_http_client(upstream_connect_timeout_seconds)?;
         let content_capture_enabled =
             db.get_setting(CONTENT_CAPTURE_ENABLED_SETTING)?.as_deref() == Some("true");
         Ok(Arc::new(Self {
             db,
             providers,
             stats: Arc::new(RuntimeStats::new()),
-            http_client,
+            http_client: ArcSwap::from_pointee(http_client),
+            upstream_connect_timeout_seconds: AtomicU64::new(upstream_connect_timeout_seconds),
             local_token,
             oauth,
             listen_address,
@@ -283,6 +294,32 @@ impl AppState {
 
     pub fn content_capture_enabled(&self) -> bool {
         self.content_capture_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http_client.load_full().as_ref().clone()
+    }
+
+    pub fn upstream_connect_timeout_seconds(&self) -> u64 {
+        self.upstream_connect_timeout_seconds
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn set_upstream_connect_timeout_seconds(&self, seconds: u64) -> Result<(), String> {
+        if !(MIN_UPSTREAM_CONNECT_TIMEOUT_SECONDS..=MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS)
+            .contains(&seconds)
+        {
+            return Err(format!(
+                "连接超时必须在 {MIN_UPSTREAM_CONNECT_TIMEOUT_SECONDS} 到 {MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS} 秒之间"
+            ));
+        }
+        let client = build_http_client(seconds)?;
+        self.db
+            .set_setting(UPSTREAM_CONNECT_TIMEOUT_SETTING, &seconds.to_string())?;
+        self.http_client.store(Arc::new(client));
+        self.upstream_connect_timeout_seconds
+            .store(seconds, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn set_content_capture_enabled(&self, enabled: bool) -> Result<(), String> {
@@ -310,6 +347,14 @@ impl AppState {
             tracing::warn!(%error, request_id, "failed to persist request content capture");
         }
     }
+}
+
+fn build_http_client(connect_timeout_seconds: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_seconds))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

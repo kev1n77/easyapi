@@ -84,7 +84,7 @@ async fn proxy_models(
         }
     };
     let mut builder = state
-        .http_client
+        .http_client()
         .get(url)
         .header(header::AUTHORIZATION, format!("Bearer {token}"));
     for (name, value) in &parts.headers {
@@ -190,6 +190,23 @@ async fn proxy_responses_endpoint(
         );
     };
 
+    let upstream_url = if compact {
+        provider.responses_compact_url()
+    } else {
+        provider.responses_url()
+    };
+    let normalize_codex_request = provider.uses_codex_oauth() && !compact;
+    tracing::info!(
+        request_id = %request_id,
+        provider_id = %provider.provider.id,
+        provider = %provider.provider.name,
+        endpoint = %upstream_url,
+        compact,
+        normalize_codex_request,
+        request_content_length = ?request_bytes,
+        "upstream request started"
+    );
+
     let (parts, body) = request.into_parts();
     if state.content_capture_enabled() {
         let request_content_type = parts
@@ -204,12 +221,6 @@ async fn proxy_responses_endpoint(
             }
         }
     }
-    let upstream_url = if compact {
-        provider.responses_compact_url()
-    } else {
-        provider.responses_url()
-    };
-    let normalize_codex_request = provider.uses_codex_oauth() && !compact;
     let (token, account_id) = match upstream_token(&state, &provider).await {
         Ok(value) => value,
         Err(error) => {
@@ -221,7 +232,7 @@ async fn proxy_responses_endpoint(
         }
     };
     let mut builder = state
-        .http_client
+        .http_client()
         .post(upstream_url)
         .header(header::AUTHORIZATION, format!("Bearer {token}"));
 
@@ -296,6 +307,13 @@ async fn proxy_responses_endpoint(
         Ok(response) => response,
         Err(error) => {
             let message = sanitized_reqwest_error(&error);
+            tracing::warn!(
+                request_id = %request_id,
+                error = %message,
+                reqwest_error = %error,
+                request_duration_ms = started.elapsed().as_millis(),
+                "upstream request failed before response"
+            );
             guard.fail(StatusCode::BAD_GATEWAY, &message);
             return json_response(
                 StatusCode::BAD_GATEWAY,
@@ -305,6 +323,22 @@ async fn proxy_responses_endpoint(
     };
 
     let status = upstream.status();
+    tracing::info!(
+        request_id = %request_id,
+        status = status.as_u16(),
+        http_version = ?upstream.version(),
+        content_type = ?header_value(upstream.headers(), &header::CONTENT_TYPE),
+        content_length = ?header_value(upstream.headers(), &header::CONTENT_LENGTH),
+        content_encoding = ?header_value(upstream.headers(), &header::CONTENT_ENCODING),
+        transfer_encoding = ?header_value(upstream.headers(), &header::TRANSFER_ENCODING),
+        upstream_request_id = ?header_value(upstream.headers(), &HeaderName::from_static("x-request-id")),
+        upstream_header_request_id = ?header_value(upstream.headers(), &HeaderName::from_static("request-id")),
+        processing_ms = ?header_value(upstream.headers(), &HeaderName::from_static("openai-processing-ms")),
+        server = ?header_value(upstream.headers(), &header::SERVER),
+        via = ?header_value(upstream.headers(), &header::VIA),
+        cf_ray = ?header_value(upstream.headers(), &HeaderName::from_static("cf-ray")),
+        "upstream response headers received"
+    );
     guard.set_status(status);
     let response_capture = guard.content_capture();
     if let Some(capture) = &response_capture {
@@ -317,7 +351,7 @@ async fn proxy_responses_endpoint(
     }
     let mut response_builder = Response::builder()
         .status(status)
-        .header("x-easyapi-request-id", request_id);
+        .header("x-easyapi-request-id", &request_id);
 
     for (name, value) in upstream.headers() {
         if should_forward_response_header(name) {
@@ -329,9 +363,12 @@ async fn proxy_responses_endpoint(
     let response_stream = stream! {
         let mut stream_error = None;
         let mut usage = TokenUsageExtractor::default();
+        let mut diagnostics = ResponseStreamDiagnostics::default();
+        let response_started = Instant::now();
         while let Some(item) = upstream_stream.next().await {
             match item {
                 Ok(bytes) => {
+                    diagnostics.observe(&bytes);
                     usage.observe(&bytes);
                     if let Some(capture) = &response_capture {
                         capture.write_response(&bytes);
@@ -341,6 +378,30 @@ async fn proxy_responses_endpoint(
                 Err(error) => {
                     let message = sanitized_reqwest_error(&error);
                     stream_error = Some(message.clone());
+                    tracing::warn!(
+                        request_id = %request_id,
+                        error = %message,
+                        reqwest_error = %error,
+                        error_is_body = error.is_body(),
+                        error_is_decode = error.is_decode(),
+                        error_is_timeout = error.is_timeout(),
+                        error_is_connect = error.is_connect(),
+                        error_is_request = error.is_request(),
+                        error_is_status = error.is_status(),
+                        error_url = ?error.url().map(|url| url.as_str()),
+                        response_bytes = diagnostics.total_bytes,
+                        response_elapsed_ms = response_started.elapsed().as_millis(),
+                        chunk_count = diagnostics.chunk_count,
+                        last_chunk_bytes = diagnostics.last_chunk_bytes,
+                        last_chunk_gap_ms = ?diagnostics.last_chunk_gap_ms,
+                        max_chunk_gap_ms = diagnostics.max_chunk_gap_ms,
+                        time_since_last_chunk_ms = ?diagnostics.time_since_last_chunk_ms(),
+                        pending_sse_line_bytes = diagnostics.line_buffer.len(),
+                        event_count = diagnostics.event_count,
+                        last_event = ?diagnostics.last_event,
+                        last_sequence_number = ?diagnostics.last_sequence_number,
+                        "upstream response stream failed"
+                    );
                     guard.mark_stream_error(message.clone());
                     yield Err(io::Error::other(message));
                     break;
@@ -349,6 +410,20 @@ async fn proxy_responses_endpoint(
         }
         guard.set_usage(usage.finish());
         if stream_error.is_none() {
+            tracing::info!(
+                request_id = %request_id,
+                response_bytes = diagnostics.total_bytes,
+                response_elapsed_ms = response_started.elapsed().as_millis(),
+                chunk_count = diagnostics.chunk_count,
+                last_chunk_bytes = diagnostics.last_chunk_bytes,
+                last_chunk_gap_ms = ?diagnostics.last_chunk_gap_ms,
+                max_chunk_gap_ms = diagnostics.max_chunk_gap_ms,
+                pending_sse_line_bytes = diagnostics.line_buffer.len(),
+                event_count = diagnostics.event_count,
+                last_event = ?diagnostics.last_event,
+                last_sequence_number = ?diagnostics.last_sequence_number,
+                "upstream response stream completed"
+            );
             if let Some(capture) = &response_capture {
                 capture.mark_response_complete();
             }
@@ -728,6 +803,82 @@ impl TokenUsageExtractor {
     }
 }
 
+#[derive(Default)]
+struct ResponseStreamDiagnostics {
+    total_bytes: u64,
+    chunk_count: u64,
+    last_chunk_bytes: usize,
+    last_chunk_at: Option<Instant>,
+    last_chunk_gap_ms: Option<u128>,
+    max_chunk_gap_ms: u128,
+    event_count: u64,
+    last_event: Option<String>,
+    last_sequence_number: Option<i64>,
+    line_buffer: Vec<u8>,
+}
+
+impl ResponseStreamDiagnostics {
+    fn observe(&mut self, bytes: &[u8]) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_chunk_at {
+            let gap_ms = now.duration_since(previous).as_millis();
+            self.last_chunk_gap_ms = Some(gap_ms);
+            self.max_chunk_gap_ms = self.max_chunk_gap_ms.max(gap_ms);
+        }
+        self.last_chunk_at = Some(now);
+        self.chunk_count = self.chunk_count.saturating_add(1);
+        self.last_chunk_bytes = bytes.len();
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len() as u64);
+        self.line_buffer.extend_from_slice(bytes);
+        let mut consumed = 0;
+        while let Some(relative_end) = self.line_buffer[consumed..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let end = consumed + relative_end;
+            let line = self.line_buffer[consumed..end].to_vec();
+            self.observe_line(&line);
+            consumed = end + 1;
+        }
+        if consumed > 0 {
+            self.line_buffer.drain(..consumed);
+        }
+        const MAX_LINE_BUFFER: usize = 64 * 1024;
+        if self.line_buffer.len() > MAX_LINE_BUFFER {
+            let keep_from = self.line_buffer.len() - MAX_LINE_BUFFER;
+            self.line_buffer.drain(..keep_from);
+        }
+    }
+
+    fn time_since_last_chunk_ms(&self) -> Option<u128> {
+        self.last_chunk_at.map(|last| last.elapsed().as_millis())
+    }
+
+    fn observe_line(&mut self, line: &[u8]) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(event) = line.strip_prefix(b"event: ") {
+            if let Ok(event) = std::str::from_utf8(event) {
+                self.last_event = Some(event.trim().to_string());
+                self.event_count = self.event_count.saturating_add(1);
+            }
+        } else if let Some(data) = line.strip_prefix(b"data: ") {
+            if let Some(event_type) = extract_json_string_field(data, b"type") {
+                self.last_event = Some(event_type);
+            }
+            if let Some(sequence_number) = find_json_number(data, b"sequence_number") {
+                self.last_sequence_number = Some(sequence_number);
+            }
+        }
+    }
+}
+
+fn header_value(headers: &HeaderMap, name: &HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
 fn extract_json_string_field(bytes: &[u8], key: &[u8]) -> Option<String> {
     let mut needle = Vec::with_capacity(key.len() + 2);
     needle.push(b'"');
@@ -1061,6 +1212,21 @@ mod tests {
                 reasoning_tokens: Some(7),
             }
         );
+    }
+
+    #[test]
+    fn tracks_last_sse_event_and_sequence_across_chunks() {
+        let mut diagnostics = ResponseStreamDiagnostics::default();
+        diagnostics.observe(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":");
+        diagnostics.observe(b"12}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":13}\n\n");
+
+        assert_eq!(diagnostics.total_bytes, 184);
+        assert_eq!(diagnostics.event_count, 2);
+        assert_eq!(
+            diagnostics.last_event.as_deref(),
+            Some("response.completed")
+        );
+        assert_eq!(diagnostics.last_sequence_number, Some(13));
     }
 
     #[test]

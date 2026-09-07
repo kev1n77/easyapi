@@ -59,6 +59,10 @@ export type ContentCaptureStatus = {
   enabled: boolean;
 };
 
+export type ProxySettings = {
+  upstreamConnectTimeoutSeconds: number;
+};
+
 export type RequestCapture = {
   requestContentType?: string;
   responseContentType?: string;
@@ -98,6 +102,8 @@ export const api = {
   listLogs: (limit?: number) => invoke<RequestLog[]>("list_request_logs", { limit }),
   getContentCaptureStatus: () => invoke<ContentCaptureStatus>("get_content_capture_status"),
   setContentCaptureEnabled: (enabled: boolean) => invoke<ContentCaptureStatus>("set_content_capture_enabled", { enabled }),
+  getProxySettings: () => invoke<ProxySettings>("get_proxy_settings"),
+  setUpstreamConnectTimeoutSeconds: (seconds: number) => invoke<ProxySettings>("set_upstream_connect_timeout_seconds", { seconds }),
   getRequestCapture: (id: string) => invoke<RequestCapture>("get_request_capture", { id }),
   clearRequestCaptures: () => invoke<void>("clear_request_captures"),
   clearRequestLogs: () => invoke<void>("clear_request_logs"),

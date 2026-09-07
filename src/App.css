@@ -100,6 +100,16 @@ th { text-align: left; color: #6f7b90; background: #141a24; font-weight: 600; pa
 td { padding: 11px 13px; border-top: 1px solid #1e2531; color: #aeb7c6; white-space: nowrap; }
 tr:hover td { background: #131924; }.error-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; color: #c27b82; }
 .setup-step { display: grid; grid-template-columns: 34px 1fr; gap: 15px; margin-bottom: 22px; }
+.settings-panel { max-width: 680px; border: 1px solid #222a38; background: #10151e; border-radius: 11px; overflow: hidden; padding-bottom: 17px; }
+.settings-panel .panel-title { padding-bottom: 15px; }
+.settings-field { padding: 18px 17px 0; }
+.settings-field label { display: flex; flex-direction: column; gap: 7px; }
+.settings-field label span { color: #aab3c3; font-size: 10px; font-weight: 600; }
+.settings-field input { width: 180px; border: 1px solid #2b3444; border-radius: 7px; outline: none; color: #dfe5ee; background: #0c1118; padding: 9px 10px; font-size: 11px; }
+.settings-field input:focus { border-color: #6170e6; box-shadow: 0 0 0 3px rgba(84, 101, 224, .1); }
+.settings-field small { display: block; margin-top: 8px; color: #606c80; font-size: 9px; }
+.settings-panel .form-error { margin: 15px 17px 0; }
+.settings-panel .dialog-actions { margin: 17px 17px 0; }
 .setup-step > span { width: 29px; height: 29px; display: grid; place-items: center; border: 1px solid #4655ba; background: #222b5b; border-radius: 50%; color: #acb6ff; font-size: 11px; font-weight: 700; }
 .setup-step h3 { margin: 4px 0 6px; font-size: 13px; }.setup-step p { margin: 0 0 10px; color: #788397; font-size: 10px; line-height: 1.5; }.setup-step code { color: #aeb8ff; }
 .code-block { position: relative; border: 1px solid #252e3d; background: #090c12; border-radius: 8px; overflow: hidden; }

@@ -1,5 +1,6 @@
 mod codex_oauth;
 mod commands;
+mod logging;
 mod models;
 mod proxy;
 mod state;
@@ -17,19 +18,12 @@ use crate::{state::AppState, storage::Database};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "easyapi=info,tower_http=info".into()),
-        )
-        .with_target(false)
-        .compact()
-        .init();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
+            let log_path = logging::init(&app_data_dir)?;
+            tracing::info!(path = %log_path.display(), "EasyAPI logging initialized");
             let db = Arc::new(Database::open(&app_data_dir.join("easyapi.sqlite3"))?);
             let listen_address = "127.0.0.1:8787".to_string();
             let std_listener = StdTcpListener::bind(&listen_address)
@@ -99,6 +93,8 @@ pub fn run() {
             commands::list_request_logs,
             commands::get_content_capture_status,
             commands::set_content_capture_enabled,
+            commands::get_proxy_settings,
+            commands::set_upstream_connect_timeout_seconds,
             commands::get_request_capture,
             commands::clear_request_captures,
             commands::clear_request_logs,

@@ -14,6 +14,7 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 - 不自动重试，不自动故障转移
 - API Key 保存到 Windows Credential Manager
 - Provider 元数据和脱敏请求记录保存到 SQLite
+- 运行日志按启动实例落盘并自动轮转
 - 可选记录 Responses 请求和响应的原始内容，默认关闭
 - 本地代理 Bearer Token 验证
 - 系统托盘常驻；关闭窗口只会隐藏
@@ -207,6 +208,14 @@ username = provider:<provider-id>
 ```text
 %APPDATA%\com.wsp.easyapi\easyapi.sqlite3
 ```
+
+运行日志位于同目录的 `logs` 文件夹：
+
+```text
+%APPDATA%\com.wsp.easyapi\logs\easyapi-YYYYMMDD-HHMMSS-PID.log
+```
+
+每次启动创建一个新的日志文件；单个文件达到 10 MiB 后轮转，最多保留两个轮转文件（`.1`、`.2`）。启动日志组最多保留最近 10 组，旧组会在新启动时自动删除。对于 Responses 请求，日志会记录请求 ID、Provider、上游地址、请求大小、HTTP 状态与版本、关键响应头、响应字节数、数据块数量与间隔、最后一个 SSE 事件及上游错误分类，便于定位长流中断。日志不会记录 API Key、Authorization Header 或请求正文。
 
 SQLite 只保存：
 

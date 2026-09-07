@@ -10,7 +10,7 @@ use crate::{
     codex_oauth::{DeviceCode, OAuthStatus},
     models::{
         AppStatus, CodexSetup, ContentCaptureStatus, ProviderInput, ProviderTestResult,
-        ProviderView, RequestCapture, RequestLog,
+        ProviderView, ProxySettings, RequestCapture, RequestLog,
     },
     state::{delete_api_key, set_api_key, AppState},
 };
@@ -151,6 +151,24 @@ pub fn set_content_capture_enabled(
 }
 
 #[tauri::command]
+pub fn get_proxy_settings(state: State<'_, Arc<AppState>>) -> ProxySettings {
+    ProxySettings {
+        upstream_connect_timeout_seconds: state.upstream_connect_timeout_seconds(),
+    }
+}
+
+#[tauri::command]
+pub fn set_upstream_connect_timeout_seconds(
+    state: State<'_, Arc<AppState>>,
+    seconds: u64,
+) -> Result<ProxySettings, String> {
+    state.set_upstream_connect_timeout_seconds(seconds)?;
+    Ok(ProxySettings {
+        upstream_connect_timeout_seconds: state.upstream_connect_timeout_seconds(),
+    })
+}
+
+#[tauri::command]
 pub fn get_request_capture(
     state: State<'_, Arc<AppState>>,
     id: String,
@@ -227,7 +245,7 @@ pub async fn test_provider(
         request_body["max_output_tokens"] = serde_json::json!(16);
     }
     let mut request = state
-        .http_client
+        .http_client()
         .post(provider.responses_url())
         .bearer_auth(token)
         .json(&request_body);
@@ -292,7 +310,7 @@ pub async fn list_provider_models(
         (provider.api_key().to_string(), None)
     };
     let mut request = state
-        .http_client
+        .http_client()
         .get(provider.models_url())
         .bearer_auth(token);
     for (name, value) in &provider.headers {

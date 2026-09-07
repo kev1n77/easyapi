@@ -1,9 +1,9 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { api, AppStatus, CodexSetup, ContentCaptureStatus, HeaderPair, Provider, ProviderInput, ProviderTestResult, RequestCapture, RequestLog, OAuthStatus } from "./api";
+import { api, AppStatus, CodexSetup, ContentCaptureStatus, HeaderPair, Provider, ProviderInput, ProviderTestResult, ProxySettings, RequestCapture, RequestLog, OAuthStatus } from "./api";
 import "./App.css";
 
-type Page = "overview" | "providers" | "requests" | "stats" | "setup";
+type Page = "overview" | "providers" | "requests" | "stats" | "setup" | "settings";
 
 const emptyStatus: AppStatus = {
   proxyRunning: false,
@@ -50,6 +50,7 @@ export default function App() {
   const [status, setStatus] = useState<AppStatus>(emptyStatus);
   const [logs, setLogs] = useState<RequestLog[]>([]);
   const [contentCapture, setContentCapture] = useState<ContentCaptureStatus>({ enabled: false });
+  const [proxySettings, setProxySettings] = useState<ProxySettings | null>(null);
   const [setup, setSetup] = useState<CodexSetup | null>(null);
   const [oauth, setOauth] = useState<OAuthStatus | null>(null);
   const [editing, setEditing] = useState<Provider | "new" | null>(null);
@@ -58,13 +59,14 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [nextProviders, nextStatus, nextLogs, nextContentCapture] = await Promise.all([
-        api.listProviders(), api.getStatus(), api.listLogs(), api.getContentCaptureStatus(),
+      const [nextProviders, nextStatus, nextLogs, nextContentCapture, nextProxySettings] = await Promise.all([
+        api.listProviders(), api.getStatus(), api.listLogs(), api.getContentCaptureStatus(), api.getProxySettings(),
       ]);
       setProviders(nextProviders);
       setStatus(nextStatus);
       setLogs(nextLogs);
       setContentCapture(nextContentCapture);
+      setProxySettings(nextProxySettings);
       setOauth(await api.getCodexOAuthStatus());
     } catch (error) {
       setNotice(errorText(error));
@@ -115,6 +117,12 @@ export default function App() {
     }
   }
 
+  async function setUpstreamConnectTimeoutSeconds(seconds: number) {
+    const next = await api.setUpstreamConnectTimeoutSeconds(seconds);
+    setProxySettings(next);
+    setNotice(`已将上游连接超时设置为 ${next.upstreamConnectTimeoutSeconds} 秒`);
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -128,6 +136,7 @@ export default function App() {
           <NavButton active={page === "requests"} icon="≡" label="请求记录" onClick={() => { setPage("requests"); void refresh(); }} />
           <NavButton active={page === "stats"} icon="▦" label="Token 统计" onClick={() => { setPage("stats"); void refresh(); }} />
           <NavButton active={page === "setup"} icon="⌘" label="Codex 配置" onClick={() => setPage("setup")} />
+          <NavButton active={page === "settings"} icon="⚙" label="设置" onClick={() => setPage("settings")} />
         </nav>
         <div className="sidebar-status">
           <span className={`status-dot ${status.proxyRunning ? "online" : "offline"}`} />
@@ -144,6 +153,7 @@ export default function App() {
             {page === "requests" && <RequestsPage logs={logs} onRefresh={refresh} contentCapture={contentCapture} onCaptureEnabledChange={setContentCaptureEnabled} notify={setNotice} />}
             {page === "stats" && <StatisticsPage logs={logs} />}
             {page === "setup" && <SetupPage setup={setup} />}
+            {page === "settings" && <SettingsPage settings={proxySettings} onSave={setUpstreamConnectTimeoutSeconds} />}
           </>
         )}
       </main>
@@ -444,6 +454,50 @@ function CaptureSection({ title, contentType, bytes, complete, content }: { titl
 function outcomeLabel(outcome: string) {
   const labels: Record<string, string> = { completed: "完成", cancelled: "请求未完成", client_cancelled: "客户端取消", proxy_error: "代理错误", upstream_http_error: "上游错误", stream_error: "流中断", streaming: "传输中" };
   return labels[outcome] ?? outcome;
+}
+
+function SettingsPage({ settings, onSave }: {
+  settings: ProxySettings | null;
+  onSave: (seconds: number) => Promise<void>;
+}) {
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (settings) setValue(String(settings.upstreamConnectTimeoutSeconds));
+  }, [settings]);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const seconds = Number(value);
+    if (!Number.isInteger(seconds) || seconds < 1 || seconds > 300) {
+      setError("请输入 1 到 300 之间的整数秒数");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await onSave(seconds);
+    } catch (saveError) {
+      setError(errorText(saveError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <section>
+    <PageHeader title="设置" subtitle="调整 EasyAPI 的本地代理行为。修改会立即应用到后续请求。" />
+    <form className="settings-panel" onSubmit={submit}>
+      <div className="panel-title"><h3>上游连接超时</h3><p>仅限制建立上游连接的阶段，不限制 Responses 请求总时长或 SSE 读取时长。</p></div>
+      <div className="settings-field">
+        <label><span>超时时间（秒）</span><input type="number" min="1" max="300" step="1" value={value} onChange={event => setValue(event.target.value)} disabled={!settings || saving} /></label>
+        <small>范围：1–300 秒，默认 15 秒。网络环境较慢时可尝试 30 秒。</small>
+      </div>
+      {error && <div className="form-error">{error}</div>}
+      <div className="dialog-actions"><button className="primary" disabled={!settings || saving}>{saving ? "保存中…" : "保存设置"}</button></div>
+    </form>
+  </section>;
 }
 
 function SetupPage({ setup }: { setup: CodexSetup | null }) {
