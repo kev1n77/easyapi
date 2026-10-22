@@ -1,5 +1,6 @@
 use std::{
     io,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -13,7 +14,7 @@ use axum::{
     Router,
 };
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::header::HeaderValue;
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -24,6 +25,13 @@ use uuid::Uuid;
 use crate::{models::RequestLog, state::AppState, storage::ContentCapture};
 
 const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const CAPACITY_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -231,29 +239,25 @@ async fn proxy_responses_endpoint(
             );
         }
     };
-    let mut builder = state
-        .http_client()
-        .post(upstream_url)
-        .header(header::AUTHORIZATION, format!("Bearer {token}"));
-
-    for (name, value) in &parts.headers {
-        if should_forward_request_header_for_body(name, normalize_codex_request) {
-            builder = builder.header(name, value);
-        }
-    }
-    for (name, value) in &provider.headers {
-        builder = builder.header(name, value);
-    }
-    if let Some(account_id) = account_id {
-        builder = builder
-            .header("chatgpt-account-id", account_id)
-            .header("originator", crate::codex_oauth::CODEX_OAUTH_ORIGINATOR)
-            .header("version", crate::codex_oauth::CODEX_OAUTH_CLIENT_VERSION);
-    }
+    let client = state.http_client();
+    let request_headers = parts.headers;
+    let mut builder = build_responses_request(
+        &client,
+        &upstream_url,
+        &token,
+        &request_headers,
+        &provider.headers,
+        account_id.as_deref(),
+        normalize_codex_request,
+    );
 
     let mut incoming = body.into_data_stream();
     let model_extractor = Arc::new(Mutex::new(RequestModelExtractor::default()));
     let model_extractor_for_stream = model_extractor.clone();
+    let replay_chunks = Arc::new(Mutex::new(Vec::<Bytes>::new()));
+    let replay_chunks_for_stream = replay_chunks.clone();
+    let request_upload_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let request_upload_complete_for_stream = request_upload_complete.clone();
     let request_capture = guard.content_capture();
     let upload_stream = stream! {
         let mut codex_normalizer = normalize_codex_request.then(CodexRequestNormalizer::default);
@@ -269,9 +273,16 @@ async fn proxy_responses_endpoint(
                     if let Some(normalizer) = &mut codex_normalizer {
                         let normalized = normalizer.observe(&bytes);
                         if !normalized.is_empty() {
-                            yield Ok::<_, io::Error>(Bytes::from(normalized));
+                            let normalized = Bytes::from(normalized);
+                            if let Ok(mut chunks) = replay_chunks_for_stream.lock() {
+                                chunks.push(normalized.clone());
+                            }
+                            yield Ok::<_, io::Error>(normalized);
                         }
                     } else {
+                        if let Ok(mut chunks) = replay_chunks_for_stream.lock() {
+                            chunks.push(bytes.clone());
+                        }
                         yield Ok::<_, io::Error>(bytes);
                     }
                 }
@@ -283,6 +294,7 @@ async fn proxy_responses_endpoint(
                     if let Some(capture) = &request_capture {
                         capture.mark_request_complete();
                     }
+                    request_upload_complete_for_stream.store(true, std::sync::atomic::Ordering::Release);
                     break;
                 }
                 Err(_) => {
@@ -293,10 +305,102 @@ async fn proxy_responses_endpoint(
         }
     };
 
-    let upstream_result = builder
+    let mut upstream_result = builder
         .body(reqwest::Body::wrap_stream(upload_stream))
         .send()
         .await;
+    let mut retry_count = 0;
+    loop {
+        let response = match upstream_result {
+            Ok(response) => response,
+            Err(_) => break,
+        };
+        if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+            upstream_result = Ok(response);
+            break;
+        }
+        let response_status = response.status();
+        let response_headers = response.headers().clone();
+        let response_body = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let message = sanitized_reqwest_error(&error);
+                guard.fail(StatusCode::BAD_GATEWAY, &message);
+                return json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error": {"message": message, "type": "easyapi_upstream_error"}}),
+                );
+            }
+        };
+        let is_capacity_error = is_server_overloaded_error(&response_body);
+        let request_can_be_replayed =
+            request_upload_complete.load(std::sync::atomic::Ordering::Acquire);
+        if retry_count >= CAPACITY_RETRY_DELAYS.len()
+            || !request_can_be_replayed
+            || !is_capacity_error
+        {
+            guard.set_status(response_status);
+            let message = if is_capacity_error {
+                "上游模型容量暂不可用，自动重试次数已用尽"
+            } else {
+                "上游返回 HTTP 503"
+            };
+            guard.fail(response_status, message);
+            let capture = guard.content_capture();
+            if let Some(capture) = capture {
+                capture.set_response_content_type(
+                    response_headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                );
+                capture.write_response(&response_body);
+                capture.mark_response_complete();
+            }
+            let mut response_builder = Response::builder()
+                .status(response_status)
+                .header("x-easyapi-request-id", &request_id);
+            for (name, value) in &response_headers {
+                if should_forward_response_header(name) {
+                    response_builder = response_builder.header(name, value);
+                }
+            }
+            return response_builder.body(Body::from(response_body)).unwrap_or_else(|error| {
+                json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": {"message": error.to_string(), "type": "easyapi_internal_error"}}),
+                )
+            });
+        }
+        let delay = response_headers
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|seconds| Duration::from_secs(seconds.min(30)))
+            .unwrap_or(CAPACITY_RETRY_DELAYS[retry_count]);
+        retry_count += 1;
+        tracing::warn!(request_id = %request_id, retry = retry_count, delay_ms = delay.as_millis(), "upstream model capacity reached; retrying request");
+        tokio::time::sleep(delay).await;
+        let chunks = replay_chunks
+            .lock()
+            .map(|chunks| chunks.clone())
+            .unwrap_or_default();
+        builder = build_responses_request(
+            &client,
+            &upstream_url,
+            &token,
+            &request_headers,
+            &provider.headers,
+            account_id.as_deref(),
+            normalize_codex_request,
+        );
+        upstream_result = builder
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                chunks.into_iter().map(Ok::<_, io::Error>),
+            )))
+            .send()
+            .await;
+    }
     let model = model_extractor
         .lock()
         .ok()
@@ -322,28 +426,146 @@ async fn proxy_responses_endpoint(
         }
     };
 
-    let status = upstream.status();
+    // Buffer SSE metadata until the first actual output event. If the stream fails
+    // with an overload event before output begins, retry without leaking a partial
+    // response (and confusing the client with duplicate response IDs/events).
+    let mut prefetched_chunks = Vec::<Bytes>::new();
+    let mut sse_retry_count = 0;
+    let mut upstream = Some(upstream);
+    let (final_status, final_headers, remaining_stream) = loop {
+        let response = upstream
+            .take()
+            .expect("response is available before stream handling");
+        let response_status = response.status();
+        let response_headers = response.headers().clone();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_ascii_lowercase);
+        let is_sse = content_type
+            .as_deref()
+            .is_some_and(|value| value.contains("text/event-stream"));
+        let may_be_sse = is_sse || content_type.is_none();
+        let mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
+            Box::pin(response.bytes_stream());
+        if !may_be_sse {
+            break (response_status, response_headers, stream);
+        }
+        let mut scanner = CapacitySseScanner::default();
+        let mut should_retry = false;
+        let mut detected_sse = is_sse;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    if !detected_sse {
+                        let mut probe = prefetched_chunks
+                            .iter()
+                            .flat_map(|chunk| chunk.iter().copied())
+                            .take(32)
+                            .collect::<Vec<_>>();
+                        probe.extend(
+                            bytes
+                                .iter()
+                                .copied()
+                                .take(32usize.saturating_sub(probe.len())),
+                        );
+                        detected_sse = is_sse_prefix(&probe);
+                        if !detected_sse {
+                            prefetched_chunks.push(bytes);
+                            if probe
+                                .first()
+                                .is_some_and(|byte| *byte != b'e' && *byte != b'd')
+                                || probe.len() >= 8
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        tracing::warn!(request_id = %request_id, status = response_status.as_u16(), content_type = ?content_type, "upstream response appears to be SSE despite missing content-type");
+                    }
+                    scanner.observe(&bytes);
+                    prefetched_chunks.push(bytes);
+                    if scanner.capacity_failed {
+                        should_retry = true;
+                        break;
+                    }
+                    if scanner.output_started || scanner.completed {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if should_retry
+            && sse_retry_count < CAPACITY_RETRY_DELAYS.len()
+            && request_upload_complete.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let delay = CAPACITY_RETRY_DELAYS[sse_retry_count];
+            sse_retry_count += 1;
+            tracing::warn!(request_id = %request_id, retry = sse_retry_count, delay_ms = delay.as_millis(), "SSE response reported model capacity; retrying request");
+            tokio::time::sleep(delay).await;
+            let chunks = replay_chunks
+                .lock()
+                .map(|chunks| chunks.clone())
+                .unwrap_or_default();
+            builder = build_responses_request(
+                &client,
+                &upstream_url,
+                &token,
+                &request_headers,
+                &provider.headers,
+                account_id.as_deref(),
+                normalize_codex_request,
+            );
+            upstream = Some(
+                match builder
+                    .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                        chunks.into_iter().map(Ok::<_, io::Error>),
+                    )))
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let message = sanitized_reqwest_error(&error);
+                        guard.fail(StatusCode::BAD_GATEWAY, &message);
+                        return json_response(
+                            StatusCode::BAD_GATEWAY,
+                            json!({"error": {"message": message, "type": "easyapi_upstream_error"}}),
+                        );
+                    }
+                },
+            );
+            prefetched_chunks.clear();
+            continue;
+        }
+        if scanner.capacity_failed {
+            tracing::error!(request_id = %request_id, status = response_status.as_u16(), retry_count = sse_retry_count, request_upload_complete = request_upload_complete.load(std::sync::atomic::Ordering::Acquire), output_started = scanner.output_started, "upstream SSE reported server_is_overloaded but request cannot be retried");
+        }
+        break (response_status, response_headers, stream);
+    };
+
+    let status = final_status;
     tracing::info!(
         request_id = %request_id,
         status = status.as_u16(),
-        http_version = ?upstream.version(),
-        content_type = ?header_value(upstream.headers(), &header::CONTENT_TYPE),
-        content_length = ?header_value(upstream.headers(), &header::CONTENT_LENGTH),
-        content_encoding = ?header_value(upstream.headers(), &header::CONTENT_ENCODING),
-        transfer_encoding = ?header_value(upstream.headers(), &header::TRANSFER_ENCODING),
-        upstream_request_id = ?header_value(upstream.headers(), &HeaderName::from_static("x-request-id")),
-        upstream_header_request_id = ?header_value(upstream.headers(), &HeaderName::from_static("request-id")),
-        processing_ms = ?header_value(upstream.headers(), &HeaderName::from_static("openai-processing-ms")),
-        server = ?header_value(upstream.headers(), &header::SERVER),
-        via = ?header_value(upstream.headers(), &header::VIA),
-        cf_ray = ?header_value(upstream.headers(), &HeaderName::from_static("cf-ray")),
+        content_type = ?header_value(&final_headers, &header::CONTENT_TYPE),
+        content_length = ?header_value(&final_headers, &header::CONTENT_LENGTH),
+        content_encoding = ?header_value(&final_headers, &header::CONTENT_ENCODING),
+        transfer_encoding = ?header_value(&final_headers, &header::TRANSFER_ENCODING),
+        upstream_request_id = ?header_value(&final_headers, &HeaderName::from_static("x-request-id")),
+        upstream_header_request_id = ?header_value(&final_headers, &HeaderName::from_static("request-id")),
+        processing_ms = ?header_value(&final_headers, &HeaderName::from_static("openai-processing-ms")),
+        server = ?header_value(&final_headers, &header::SERVER),
+        via = ?header_value(&final_headers, &header::VIA),
+        cf_ray = ?header_value(&final_headers, &HeaderName::from_static("cf-ray")),
         "upstream response headers received"
     );
     guard.set_status(status);
     let response_capture = guard.content_capture();
     if let Some(capture) = &response_capture {
-        let response_content_type = upstream
-            .headers()
+        let response_content_type = final_headers
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
@@ -353,13 +575,18 @@ async fn proxy_responses_endpoint(
         .status(status)
         .header("x-easyapi-request-id", &request_id);
 
-    for (name, value) in upstream.headers() {
+    for (name, value) in &final_headers {
         if should_forward_response_header(name) {
             response_builder = response_builder.header(name, value);
         }
     }
 
-    let mut upstream_stream = upstream.bytes_stream();
+    let mut upstream_stream = futures_util::stream::iter(
+        prefetched_chunks
+            .into_iter()
+            .map(Ok::<Bytes, reqwest::Error>),
+    )
+    .chain(remaining_stream);
     let response_stream = stream! {
         let mut stream_error = None;
         let mut usage = TokenUsageExtractor::default();
@@ -463,6 +690,131 @@ async fn upstream_token(
         return Ok((token, (!account_id.is_empty()).then_some(account_id)));
     }
     Ok((provider.api_key().to_string(), None))
+}
+
+fn build_responses_request(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    request_headers: &HeaderMap,
+    provider_headers: &HeaderMap,
+    account_id: Option<&str>,
+    body_rewritten: bool,
+) -> reqwest::RequestBuilder {
+    let mut builder = client
+        .post(url)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    for (name, value) in request_headers {
+        if should_forward_request_header_for_body(name, body_rewritten) {
+            builder = builder.header(name, value);
+        }
+    }
+    for (name, value) in provider_headers {
+        builder = builder.header(name, value);
+    }
+    if let Some(account_id) = account_id {
+        builder = builder
+            .header("chatgpt-account-id", account_id)
+            .header("originator", crate::codex_oauth::CODEX_OAUTH_ORIGINATOR)
+            .header("version", crate::codex_oauth::CODEX_OAUTH_CLIENT_VERSION);
+    }
+    builder
+}
+
+fn is_server_overloaded_error(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/code")
+                .and_then(|code| code.as_str().map(str::to_owned))
+        })
+        .as_deref()
+        == Some("server_is_overloaded")
+}
+
+#[derive(Default)]
+struct CapacitySseScanner {
+    pending: Vec<u8>,
+    capacity_failed: bool,
+    output_started: bool,
+    completed: bool,
+}
+
+impl CapacitySseScanner {
+    fn observe(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        while let Some((event_end, separator_len)) = find_sse_event_end(&self.pending) {
+            let event = self.pending.drain(..event_end).collect::<Vec<_>>();
+            self.pending.drain(..separator_len);
+            self.inspect_event(&event);
+            if self.capacity_failed || self.output_started || self.completed {
+                break;
+            }
+        }
+    }
+
+    fn inspect_event(&mut self, event: &[u8]) {
+        let text = String::from_utf8_lossy(event);
+        let mut event_name = None;
+        let mut data = String::new();
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("event:") {
+                event_name = Some(value.trim());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(value.trim_start());
+            }
+        }
+        let parsed_data = serde_json::from_str::<serde_json::Value>(&data).ok();
+        let event_name = event_name
+            .or_else(|| {
+                parsed_data
+                    .as_ref()
+                    .and_then(|value| value.get("type"))
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap_or_default();
+        if event_name == "response.failed"
+            && parsed_data
+                .as_ref()
+                .and_then(|value| value.pointer("/response/error/code"))
+                .and_then(|code| code.as_str())
+                == Some("server_is_overloaded")
+        {
+            self.capacity_failed = true;
+        } else if event_name == "response.completed" {
+            self.completed = true;
+        } else if event_name.starts_with("response.output")
+            || event_name.starts_with("response.content_part")
+            || event_name.starts_with("response.reasoning")
+            || event_name.starts_with("response.refusal")
+        {
+            self.output_started = true;
+        }
+    }
+}
+
+fn find_sse_event_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2))
+        .or_else(|| {
+            bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| (index, 4))
+        })
+}
+
+fn is_sse_prefix(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"event:")
+        || bytes.starts_with(b"data:")
+        || bytes.starts_with(b"\r\nevent:")
+        || bytes.starts_with(b"\r\ndata:")
 }
 
 fn should_forward_request_header(name: &HeaderName) -> bool {
@@ -1103,6 +1455,48 @@ mod tests {
         );
         assert!(authorized(&headers, "secret"));
         assert!(!authorized(&headers, "secret2"));
+    }
+
+    #[test]
+    fn only_server_overloaded_error_code_is_retryable_capacity_error() {
+        assert!(is_server_overloaded_error(
+            br#"{"error":{"code":"server_is_overloaded","message":"busy"}}"#
+        ));
+        assert!(!is_server_overloaded_error(
+            br#"{"error":{"code":"rate_limit_exceeded","message":"capacity"}}"#
+        ));
+        assert!(!is_server_overloaded_error(
+            br#"{"message":"server_is_overloaded"}"#
+        ));
+    }
+
+    #[test]
+    fn sse_capacity_failure_is_detected_before_output_is_exposed() {
+        let mut scanner = CapacitySseScanner::default();
+        scanner.observe(b"event: response.created\ndata: {}\n\n");
+        assert!(!scanner.capacity_failed);
+        assert!(!scanner.output_started);
+        scanner.observe(b"data: {\"type\":\"response.failed\",\"sequence_number\":4,\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n");
+        assert!(scanner.capacity_failed);
+        assert!(!scanner.output_started);
+    }
+
+    #[test]
+    fn sse_output_event_marks_stream_as_not_safely_replayable() {
+        let mut scanner = CapacitySseScanner::default();
+        scanner.observe(b"event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\n");
+        assert!(scanner.output_started);
+        assert!(!scanner.capacity_failed);
+    }
+
+    #[test]
+    fn recognizes_sse_prefix_when_upstream_omits_content_type() {
+        assert!(is_sse_prefix(b"event: response.created\n"));
+        assert!(is_sse_prefix(b"data: {\"type\":\"response.failed\"}"));
+        assert!(is_sse_prefix(b"event:"));
+        assert!(!is_sse_prefix(
+            b"{\"error\":{\"code\":\"model_not_found\"}}"
+        ));
     }
 
     #[test]
