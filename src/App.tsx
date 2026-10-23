@@ -417,7 +417,7 @@ function RequestsPage({ logs, onRefresh, contentCapture, onCaptureEnabledChange,
     <PageHeader title="请求记录" subtitle={contentCapture.enabled ? "正在原样保存新的 Responses 请求和响应内容。" : "仅保存状态、耗时和请求大小；内容记录当前已关闭。"} action={<div className="request-actions"><label className="capture-toggle"><span>记录内容</span><input type="checkbox" checked={contentCapture.enabled} onChange={event => void onCaptureEnabledChange(event.target.checked)} /></label>{(contentCapture.enabled || hasCapturedContent) && <button className="secondary" disabled={busy} onClick={() => void clearCaptures()}>{clearing ? "清空中…" : "清空内容"}</button>}{logs.length > 0 && <button className="secondary" disabled={busy} onClick={() => void clearLogs()}>{clearingLogs ? "清理中…" : "清理记录"}</button>}<button className="secondary" onClick={() => void onRefresh()}>刷新</button></div>} />
     <div className="table-panel">
       <table><thead><tr><th>时间</th><th>Provider</th><th>状态</th><th>结果</th><th>请求大小</th><th>耗时</th><th>内容</th><th>错误</th></tr></thead>
-        <tbody>{logs.map(log => <tr key={log.id}><td>{formatTime(log.startedAt)}</td><td>{log.providerName ?? "—"}</td><td><span className={`http-status ${log.statusCode && log.statusCode < 400 ? "good" : "bad"}`}>{log.statusCode ?? "ERR"}</span></td><td>{outcomeLabel(log.outcome)}</td><td>{formatBytes(log.requestBytes)}</td><td>{log.durationMs} ms</td><td>{log.contentCaptured ? <button className="content-button" onClick={() => setViewingCapture(log.id)}>查看</button> : "—"}</td><td className="error-cell" title={log.error}>{log.error ?? "—"}</td></tr>)}</tbody>
+        <tbody>{logs.map(log => <tr key={log.id}><td>{formatTime(log.startedAt)}</td><td>{log.providerName ?? "—"}</td><td><span className={`http-status ${log.statusCode && log.statusCode < 400 ? "good" : "bad"}`}>{log.statusCode ?? "ERR"}</span></td><td>{outcomeLabel(log.outcome)}{log.retryCount > 0 && <small className="retry-note">自动重试 {log.retryCount} 次</small>}</td><td>{formatBytes(log.requestBytes)}</td><td>{log.durationMs} ms</td><td>{log.contentCaptured ? <button className="content-button" onClick={() => setViewingCapture(log.id)}>查看</button> : "—"}</td><td className="error-cell" title={log.error}>{log.error ?? "—"}</td></tr>)}</tbody>
       </table>
       {logs.length === 0 && <div className="empty">暂无请求记录</div>}
     </div>
@@ -452,7 +452,7 @@ function CaptureSection({ title, contentType, bytes, complete, content }: { titl
 }
 
 function outcomeLabel(outcome: string) {
-  const labels: Record<string, string> = { completed: "完成", cancelled: "请求未完成", client_cancelled: "客户端取消", proxy_error: "代理错误", upstream_http_error: "上游错误", stream_error: "流中断", streaming: "传输中" };
+  const labels: Record<string, string> = { completed: "完成", completed_client_disconnect: "完成后客户端断开", cancelled: "请求未完成", client_disconnected: "客户端断开（响应未完成）", client_cancelled: "客户端断开（历史记录）", proxy_error: "代理错误", upstream_http_error: "上游错误", stream_error: "流中断", streaming: "传输中" };
   return labels[outcome] ?? outcome;
 }
 

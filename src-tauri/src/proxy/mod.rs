@@ -379,6 +379,7 @@ async fn proxy_responses_endpoint(
             .map(|seconds| Duration::from_secs(seconds.min(30)))
             .unwrap_or(CAPACITY_RETRY_DELAYS[retry_count]);
         retry_count += 1;
+        guard.record_retry();
         tracing::warn!(request_id = %request_id, retry = retry_count, delay_ms = delay.as_millis(), "upstream model capacity reached; retrying request");
         tokio::time::sleep(delay).await;
         let chunks = replay_chunks
@@ -503,6 +504,7 @@ async fn proxy_responses_endpoint(
         {
             let delay = CAPACITY_RETRY_DELAYS[sse_retry_count];
             sse_retry_count += 1;
+            guard.record_retry();
             tracing::warn!(request_id = %request_id, retry = sse_retry_count, delay_ms = delay.as_millis(), "SSE response reported model capacity; retrying request");
             tokio::time::sleep(delay).await;
             let chunks = replay_chunks
@@ -596,6 +598,9 @@ async fn proxy_responses_endpoint(
             match item {
                 Ok(bytes) => {
                     diagnostics.observe(&bytes);
+                    if diagnostics.last_event.as_deref() == Some("response.completed") {
+                        guard.mark_response_completed();
+                    }
                     usage.observe(&bytes);
                     if let Some(capture) = &response_capture {
                         capture.write_response(&bytes);
@@ -1335,6 +1340,8 @@ struct RequestGuard {
     started: Instant,
     status_code: Option<u16>,
     outcome: String,
+    response_completed: bool,
+    retry_count: u32,
     error: Option<String>,
     request_bytes: Option<u64>,
     model: Option<String>,
@@ -1362,6 +1369,8 @@ impl RequestGuard {
             started,
             status_code: None,
             outcome: "cancelled".to_string(),
+            response_completed: false,
+            retry_count: 0,
             error: None,
             request_bytes,
             model: None,
@@ -1373,10 +1382,18 @@ impl RequestGuard {
     fn set_status(&mut self, status: StatusCode) {
         self.status_code = Some(status.as_u16());
         self.outcome = if status.is_success() {
-            "client_cancelled".to_string()
+            "client_disconnected".to_string()
         } else {
             "upstream_http_error".to_string()
         };
+    }
+
+    fn mark_response_completed(&mut self) {
+        self.response_completed = true;
+    }
+
+    fn record_retry(&mut self) {
+        self.retry_count = self.retry_count.saturating_add(1);
     }
 
     fn fail(&mut self, status: StatusCode, error: &str) {
@@ -1417,6 +1434,11 @@ impl Drop for RequestGuard {
     fn drop(&mut self) {
         let error = self.error.clone();
         self.state.stats.finish(error.clone());
+        let outcome = if self.outcome == "client_disconnected" && self.response_completed {
+            "completed_client_disconnect".to_string()
+        } else {
+            self.outcome.clone()
+        };
         self.state.record_log(&RequestLog {
             id: self.id.clone(),
             provider_id: self.provider_id.clone(),
@@ -1425,7 +1447,8 @@ impl Drop for RequestGuard {
             started_at: self.started_at.clone(),
             duration_ms: self.started.elapsed().as_millis().min(i64::MAX as u128) as i64,
             status_code: self.status_code,
-            outcome: self.outcome.clone(),
+            outcome,
+            retry_count: self.retry_count,
             error,
             request_bytes: self.request_bytes,
             input_tokens: self.usage.input_tokens,
@@ -1747,6 +1770,8 @@ mod tests {
         let logs = state.db.list_request_logs(None).unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].model.as_deref(), Some("test"));
+        assert_eq!(logs[0].outcome, "completed");
+        assert_eq!(logs[0].retry_count, 0);
         assert_eq!(logs[0].input_tokens, Some(12));
         assert_eq!(logs[0].output_tokens, Some(34));
         assert_eq!(logs[0].total_tokens, Some(46));

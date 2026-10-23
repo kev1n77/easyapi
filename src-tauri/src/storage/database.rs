@@ -32,6 +32,7 @@ fn ensure_request_log_columns(conn: &Connection) -> Result<(), String> {
         ("total_tokens", "INTEGER"),
         ("cached_input_tokens", "INTEGER"),
         ("reasoning_tokens", "INTEGER"),
+        ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !existing.contains(name) {
             conn.execute(
@@ -103,6 +104,7 @@ impl Database {
                 duration_ms INTEGER NOT NULL,
                 status_code INTEGER,
                 outcome TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
                 request_bytes INTEGER,
                 input_tokens INTEGER,
@@ -261,9 +263,9 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO request_logs
-             (id, provider_id, provider_name, model, started_at, duration_ms, status_code, outcome, error, request_bytes,
+             (id, provider_id, provider_name, model, started_at, duration_ms, status_code, outcome, retry_count, error, request_bytes,
               input_tokens, output_tokens, total_tokens, cached_input_tokens, reasoning_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 log.id,
                 log.provider_id,
@@ -273,6 +275,7 @@ impl Database {
                 log.duration_ms,
                 log.status_code,
                 log.outcome,
+                log.retry_count,
                 log.error,
                 log.request_bytes,
                 log.input_tokens,
@@ -294,7 +297,7 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 "SELECT id, provider_id, provider_name, model, started_at, duration_ms,
-                        status_code, outcome, error, request_bytes, input_tokens, output_tokens,
+                        status_code, outcome, retry_count, error, request_bytes, input_tokens, output_tokens,
                         total_tokens, cached_input_tokens, reasoning_tokens,
                         EXISTS(SELECT 1 FROM request_captures WHERE request_id = request_logs.id)
                  FROM request_logs ORDER BY started_at DESC LIMIT ?1",
@@ -311,14 +314,15 @@ impl Database {
                     duration_ms: row.get(5)?,
                     status_code: row.get::<_, Option<u16>>(6)?,
                     outcome: row.get(7)?,
-                    error: row.get(8)?,
-                    request_bytes: row.get(9)?,
-                    input_tokens: row.get(10)?,
-                    output_tokens: row.get(11)?,
-                    total_tokens: row.get(12)?,
-                    cached_input_tokens: row.get(13)?,
-                    reasoning_tokens: row.get(14)?,
-                    content_captured: row.get(15)?,
+                    retry_count: row.get(8)?,
+                    error: row.get(9)?,
+                    request_bytes: row.get(10)?,
+                    input_tokens: row.get(11)?,
+                    output_tokens: row.get(12)?,
+                    total_tokens: row.get(13)?,
+                    cached_input_tokens: row.get(14)?,
+                    reasoning_tokens: row.get(15)?,
+                    content_captured: row.get(16)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -691,6 +695,7 @@ mod tests {
             duration_ms: 1,
             status_code: Some(200),
             outcome: "completed".to_string(),
+            retry_count: 0,
             error: None,
             request_bytes: None,
             input_tokens: None,
@@ -759,6 +764,7 @@ mod tests {
             duration_ms: 1,
             status_code: Some(200),
             outcome: "completed".to_string(),
+            retry_count: 2,
             error: None,
             request_bytes: None,
             input_tokens: Some(10),
@@ -773,6 +779,7 @@ mod tests {
         let logs = db.list_request_logs(None).unwrap();
         assert_eq!(logs[0].model.as_deref(), Some("gpt-5"));
         assert_eq!(logs[0].total_tokens, Some(30));
+        assert_eq!(logs[0].retry_count, 2);
     }
 
     #[test]
@@ -788,6 +795,7 @@ mod tests {
             duration_ms: 1,
             status_code: Some(200),
             outcome: "completed".to_string(),
+            retry_count: 0,
             error: None,
             request_bytes: None,
             input_tokens: None,

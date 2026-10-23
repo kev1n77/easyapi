@@ -45,6 +45,7 @@ export type RequestLog = {
   durationMs: number;
   statusCode?: number;
   outcome: string;
+  retryCount: number;
   error?: string;
   requestBytes?: number;
   inputTokens?: number;

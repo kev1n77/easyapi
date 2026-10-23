@@ -11,7 +11,7 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 - 多 Provider 管理：名称、Base URL、API Key、测试模型、额外请求头；可从已保存的 Provider 拉取模型列表
 - 手动原子切换 Provider
 - 已开始的请求继续使用原 Provider，新请求使用切换后的 Provider
-- 不自动重试，不自动故障转移
+- 上游容量错误自动重试，并在请求记录中显示重试次数
 - API Key 保存到 Windows Credential Manager
 - Provider 元数据和脱敏请求记录保存到 SQLite
 - 运行日志按启动实例落盘并自动轮转
@@ -28,7 +28,7 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 
 - 自动故障转移
 - 自动切换 Key
-- 自动重放请求
+- 非容量错误不自动重放请求
 - 在未开启内容记录时缓存或持久化 Prompt、源代码和响应正文
 - 修改请求中的模型名称
 - Chat Completions API
@@ -224,7 +224,7 @@ SQLite 只保存：
 - 自定义请求头
 - 当前 Provider ID
 - 本地代理 Token
-- 请求状态、耗时、大小等脱敏元数据
+- 请求状态、耗时、大小、自动重试次数等脱敏元数据
 
 ChatGPT OAuth 的 access/refresh token 保存在应用数据目录的 `codex_oauth.json`，不写入 SQLite，也不会写入 Codex 的 `~/.codex/auth.json`。
 

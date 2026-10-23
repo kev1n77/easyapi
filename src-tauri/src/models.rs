@@ -75,6 +75,7 @@ pub struct RequestLog {
     pub duration_ms: i64,
     pub status_code: Option<u16>,
     pub outcome: String,
+    pub retry_count: u32,
     pub error: Option<String>,
     pub request_bytes: Option<u64>,
     pub input_tokens: Option<i64>,
