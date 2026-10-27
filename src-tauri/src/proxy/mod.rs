@@ -42,6 +42,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/responses", post(proxy_responses))
         .route("/responses/compact", post(proxy_responses_compact))
         .route("/v1/responses/compact", post(proxy_responses_compact))
+        .route("/images/generations", post(proxy_images_generations))
+        .route("/v1/images/generations", post(proxy_images_generations))
+        .route("/images/edits", post(proxy_images_edits))
+        .route("/v1/images/edits", post(proxy_images_edits))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -147,20 +151,66 @@ async fn proxy_responses(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
 ) -> Response<Body> {
-    proxy_responses_endpoint(state, request, false).await
+    proxy_post_endpoint(state, request, PostRoute::Responses).await
 }
 
 async fn proxy_responses_compact(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
 ) -> Response<Body> {
-    proxy_responses_endpoint(state, request, true).await
+    proxy_post_endpoint(state, request, PostRoute::ResponsesCompact).await
 }
 
-async fn proxy_responses_endpoint(
+async fn proxy_images_generations(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+) -> Response<Body> {
+    proxy_post_endpoint(state, request, PostRoute::ImagesGenerations).await
+}
+
+async fn proxy_images_edits(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+) -> Response<Body> {
+    proxy_post_endpoint(state, request, PostRoute::ImagesEdits).await
+}
+
+#[derive(Clone, Copy)]
+enum PostRoute {
+    Responses,
+    ResponsesCompact,
+    ImagesGenerations,
+    ImagesEdits,
+}
+
+impl PostRoute {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::ResponsesCompact => "responses/compact",
+            Self::ImagesGenerations => "images/generations",
+            Self::ImagesEdits => "images/edits",
+        }
+    }
+
+    fn upstream_url(self, provider: &crate::state::ProviderRuntime) -> String {
+        match self {
+            Self::Responses => provider.responses_url(),
+            Self::ResponsesCompact => provider.responses_compact_url(),
+            Self::ImagesGenerations => provider.images_generations_url(),
+            Self::ImagesEdits => provider.images_edits_url(),
+        }
+    }
+
+    fn normalize_codex_request(self, provider: &crate::state::ProviderRuntime) -> bool {
+        matches!(self, Self::Responses) && provider.uses_codex_oauth()
+    }
+}
+
+async fn proxy_post_endpoint(
     state: Arc<AppState>,
     request: Request<Body>,
-    compact: bool,
+    route: PostRoute,
 ) -> Response<Body> {
     let request_id = Uuid::new_v4().to_string();
     let started_at = Utc::now().to_rfc3339();
@@ -198,18 +248,18 @@ async fn proxy_responses_endpoint(
         );
     };
 
-    let upstream_url = if compact {
-        provider.responses_compact_url()
-    } else {
-        provider.responses_url()
-    };
-    let normalize_codex_request = provider.uses_codex_oauth() && !compact;
+    let mut upstream_url = route.upstream_url(&provider);
+    if let Some(query) = request.uri().query() {
+        upstream_url.push('?');
+        upstream_url.push_str(query);
+    }
+    let normalize_codex_request = route.normalize_codex_request(&provider);
     tracing::info!(
         request_id = %request_id,
         provider_id = %provider.provider.id,
         provider = %provider.provider.name,
+        route = route.name(),
         endpoint = %upstream_url,
-        compact,
         normalize_codex_request,
         request_content_length = ?request_bytes,
         "upstream request started"
@@ -1865,6 +1915,110 @@ mod tests {
                 br#"{"object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
             )
         );
+    }
+
+    #[tokio::test]
+    async fn forwards_image_generation_and_edits_without_rewriting_the_body() {
+        use axum::{body::Bytes, routing::post, Router};
+        use http_body_util::BodyExt;
+        use std::sync::Mutex;
+        use tempfile::tempdir;
+        use tower::ServiceExt;
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, Bytes)>::new()));
+        let seen_for_upstream = seen.clone();
+        let upstream = {
+            let seen_for_upstream = seen_for_upstream.clone();
+            move |request: Request<Body>| {
+                let seen_for_upstream = seen_for_upstream.clone();
+                async move {
+                    assert_eq!(
+                        request.headers()[header::AUTHORIZATION],
+                        "Bearer upstream-key"
+                    );
+                    let path = request.uri().path().to_string();
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    seen_for_upstream.lock().unwrap().push((path, body.clone()));
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"created":1,"data":[{"b64_json":"aW1hZ2U="}]}"#,
+                        ))
+                        .unwrap()
+                }
+            }
+        };
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                upstream_listener,
+                Router::new()
+                    .route("/v1/images/generations", post(upstream.clone()))
+                    .route("/v1/images/edits", post(upstream)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let temp = tempdir().unwrap();
+        let db =
+            Arc::new(crate::storage::Database::open(&temp.path().join("images.sqlite3")).unwrap());
+        let state = crate::state::AppState::new(
+            db,
+            "127.0.0.1:8787".to_string(),
+            crate::codex_oauth::CodexOAuthManager::new(temp.path().join("oauth.json")).unwrap(),
+        )
+        .unwrap();
+        state
+            .providers
+            .set_active_for_test(crate::state::ProviderRuntime::new_for_test(
+                crate::models::Provider {
+                    id: "images-test".to_string(),
+                    name: "Images Test".to_string(),
+                    base_url: format!("http://{upstream_address}/v1"),
+                    test_model: "gpt-image-1.5".to_string(),
+                    extra_headers: vec![],
+                    auth_type: crate::models::AUTH_TYPE_API_KEY.to_string(),
+                    created_at: Utc::now().to_rfc3339(),
+                    updated_at: Utc::now().to_rfc3339(),
+                },
+                "upstream-key".to_string(),
+            ));
+
+        let generation = r#"{"model":"gpt-image-1.5","prompt":"a red fox","store":true,"max_output_tokens":128}"#;
+        let edit = r#"{"model":"gpt-image-1.5","prompt":"add a hat","images":[{"image_url":"data:image/png;base64,Zm9v"}],"store":true}"#;
+        for (path, body) in [
+            ("/v1/images/generations", generation),
+            ("/images/edits", edit),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", state.local_token),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let response_body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                response_body,
+                Bytes::from_static(br#"{"created":1,"data":[{"b64_json":"aW1hZ2U="}]}"#)
+            );
+        }
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "/v1/images/generations");
+        assert_eq!(seen[0].1, Bytes::from_static(generation.as_bytes()));
+        assert_eq!(seen[1].0, "/v1/images/edits");
+        assert_eq!(seen[1].1, Bytes::from_static(edit.as_bytes()));
     }
 
     #[tokio::test]

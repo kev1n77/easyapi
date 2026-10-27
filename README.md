@@ -5,6 +5,7 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 ## 当前功能
 
 - `POST /v1/responses`、`POST /responses`、`POST /v1/responses/compact` 和 `POST /responses/compact` 透明转发
+- `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits` 透明转发。Codex 订阅生图走这两个接口，不经过 Responses
 - `GET /v1/models` 和 `GET /models` 透明转发
 - 请求体直接流式上传，不解析为完整 JSON，不设置应用层总大小限制
 - JSON 和 SSE 响应直接流式返回
@@ -21,7 +22,7 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 - 手动连接测试
 - Codex 官方 ChatGPT Plus/Pro 订阅 OAuth 登录，自动刷新 access token
 - 官方订阅也作为 EasyAPI 内部 Provider，可在不重启 Codex 的情况下切换
-- 官方订阅请求会流式兼容 ChatGPT Codex 后端：移除顶层 `max_output_tokens`，并强制使用 `store: false`
+- 官方订阅的 Responses 请求会流式兼容 ChatGPT Codex 后端：移除顶层 `max_output_tokens`，并强制使用 `store: false`。生图和改图请求保持原样转发
 - Codex 配置和 PowerShell 环境变量命令生成
 
 ## 明确不做的事情
