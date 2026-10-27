@@ -23,7 +23,7 @@ jobs:
         shell: pwsh
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Ensure VBScript for WiX
         run: |
@@ -50,12 +50,12 @@ jobs:
           exit $LASTEXITCODE
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 10
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -83,7 +83,7 @@ jobs:
         run: pnpm exec tauri build --bundles nsis,msi
 
       - name: Upload NSIS installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: easyapi-windows-nsis
           path: src-tauri/target/release/bundle/nsis/*-setup.exe
@@ -91,7 +91,7 @@ jobs:
           retention-days: 30
 
       - name: Upload MSI installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: easyapi-windows-msi
           path: src-tauri/target/release/bundle/msi/*.msi
@@ -99,7 +99,7 @@ jobs:
           retention-days: 30
 
       - name: Publish nightly release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: nightly-${{ github.run_id }}-${{ github.run_attempt }}
           name: EasyAPI Nightly #${{ github.run_number }}
