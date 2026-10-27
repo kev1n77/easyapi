@@ -25,11 +25,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Enable VBScript for WiX
+      - name: Ensure VBScript for WiX
         run: |
+          $cscript = Get-Command cscript.exe -ErrorAction SilentlyContinue
+          if ($cscript) {
+            Write-Host "cscript present: $($cscript.Source)"
+          }
           $info = & dism.exe /online /get-featureinfo /featurename:VBSCRIPT
           $info | Out-Host
-          if ($info -match 'State : Enabled' -or $info -match '状态 : 已启用') {
+          if ($LASTEXITCODE -ne 0) {
+            if ($cscript) {
+              Write-Host 'VBSCRIPT is not an optional feature on this image; cscript is already available'
+              exit 0
+            }
+            Write-Error 'VBScript is unavailable, so WiX cannot build an MSI'
+            exit 1
+          }
+          if ($info -match 'State : Enabled') {
             Write-Host 'VBSCRIPT already enabled'
             exit 0
           }
