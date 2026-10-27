@@ -39,27 +39,32 @@ impl ProviderRuntime {
     }
 
     pub fn responses_url(&self) -> String {
-        if self.uses_codex_oauth() {
-            return format!("{}/responses", crate::codex_oauth::CODEX_BASE_URL);
-        }
-        format!("{}/responses", self.provider.base_url.trim_end_matches('/'))
+        self.upstream_url("responses")
     }
 
     pub fn responses_compact_url(&self) -> String {
-        if self.uses_codex_oauth() {
-            return format!("{}/responses/compact", crate::codex_oauth::CODEX_BASE_URL);
-        }
-        format!(
-            "{}/responses/compact",
-            self.provider.base_url.trim_end_matches('/')
-        )
+        self.upstream_url("responses/compact")
     }
 
     pub fn models_url(&self) -> String {
-        if self.uses_codex_oauth() {
-            return format!("{}/models", crate::codex_oauth::CODEX_BASE_URL);
-        }
-        format!("{}/models", self.provider.base_url.trim_end_matches('/'))
+        self.upstream_url("models")
+    }
+
+    pub fn images_generations_url(&self) -> String {
+        self.upstream_url("images/generations")
+    }
+
+    pub fn images_edits_url(&self) -> String {
+        self.upstream_url("images/edits")
+    }
+
+    fn upstream_url(&self, path: &str) -> String {
+        let base = if self.uses_codex_oauth() {
+            crate::codex_oauth::CODEX_BASE_URL
+        } else {
+            self.provider.base_url.trim_end_matches('/')
+        };
+        format!("{base}/{path}")
     }
 }
 
@@ -408,6 +413,14 @@ mod tests {
         assert_eq!(
             runtime.models_url(),
             "https://chatgpt.com/backend-api/codex/models"
+        );
+        assert_eq!(
+            runtime.images_generations_url(),
+            "https://chatgpt.com/backend-api/codex/images/generations"
+        );
+        assert_eq!(
+            runtime.images_edits_url(),
+            "https://chatgpt.com/backend-api/codex/images/edits"
         );
     }
 }

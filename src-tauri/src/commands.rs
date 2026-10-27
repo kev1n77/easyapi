@@ -188,21 +188,7 @@ pub fn clear_request_logs(state: State<'_, Arc<AppState>>) -> Result<(), String>
 
 #[tauri::command]
 pub fn get_codex_setup(state: State<'_, Arc<AppState>>) -> CodexSetup {
-    let config_toml = format!(
-        r#"model_provider = "easyapi"
-
-[model_providers.easyapi]
-name = "EasyAPI Local Proxy"
-base_url = "http://{}/v1"
-env_key = "EASYAPI_LOCAL_TOKEN"
-wire_api = "responses"
-supports_websockets = false
-request_max_retries = 0
-stream_max_retries = 0
-stream_idle_timeout_ms = 300000
-"#,
-        state.listen_address
-    );
+    let config_toml = codex_config_toml(&state.listen_address);
     let escaped = state.local_token.clone();
     let powershell_command = format!(
         "[Environment]::SetEnvironmentVariable(\"EASYAPI_LOCAL_TOKEN\", \"{}\", \"User\")",
@@ -440,6 +426,25 @@ async fn read_response_preview(response: reqwest::Response, max_bytes: usize) ->
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+fn codex_config_toml(listen_address: &str) -> String {
+    format!(
+        r#"model_provider = "easyapi"
+
+[model_providers.easyapi]
+name = "EasyAPI Local Proxy"
+base_url = "http://{listen_address}/v1"
+env_key = "EASYAPI_LOCAL_TOKEN"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 300000
+http_headers = {{ "x-openai-actor-authorization" = "easyapi" }}
+"#
+    )
+}
+
 fn summarize_upstream_error(status: u16, body: &str) -> String {
     let message = serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -490,5 +495,14 @@ mod tests {
             auth_type: crate::models::AUTH_TYPE_API_KEY.to_string(),
         };
         assert!(validate_provider_input(&mut input).is_err());
+    }
+
+    #[test]
+    fn codex_config_enables_builtin_image_tool_without_replacing_local_auth() {
+        let config = codex_config_toml("127.0.0.1:8787");
+        assert!(config.contains("env_key = \"EASYAPI_LOCAL_TOKEN\""));
+        assert!(config.contains("requires_openai_auth = false"));
+        assert!(config.contains("x-openai-actor-authorization"));
+        assert!(config.contains("base_url = \"http://127.0.0.1:8787/v1\""));
     }
 }
