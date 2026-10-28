@@ -511,7 +511,7 @@ function SetupPage({ setup }: { setup: CodexSetup | null }) {
   return <section>
     <PageHeader title="Codex 配置" subtitle="只需配置一次，之后所有上游切换都在 EasyAPI 内完成。" />
     <div className="setup-step"><span>1</span><div><h3>设置本地认证 Token</h3><p>在 PowerShell 中执行，然后重启一次 Codex 使用户环境变量生效。</p><CodeBlock value={setup.powershellCommand} copied={copied === "ps"} onCopy={() => void copy("ps", setup.powershellCommand)} /></div></div>
-    <div className="setup-step"><span>2</span><div><h3>修改用户级 config.toml</h3><p>把下面配置加入 <code>~/.codex/config.toml</code>。模型名称仍由你现有的 Codex 配置决定。</p><CodeBlock value={setup.configToml} copied={copied === "toml"} onCopy={() => void copy("toml", setup.configToml)} /></div></div>
+    <div className="setup-step"><span>2</span><div><h3>修改用户级 config.toml</h3><p>把下面配置加入 <code>~/.codex/config.toml</code>。模型名称仍由你现有的 Codex 配置决定。<code>requires_openai_auth = false</code> 会继续使用上面的本地 Token；<code>x-openai-actor-authorization</code> 只用来注册内置生图工具，代理转发前会去掉它。保存后请彻底退出 Codex，再新建会话。</p><CodeBlock value={setup.configToml} copied={copied === "toml"} onCopy={() => void copy("toml", setup.configToml)} /></div></div>
     <div className="setup-step"><span>3</span><div><h3>保持 EasyAPI 运行</h3><p>关闭窗口会隐藏到系统托盘，不会停止代理。需要完全关闭时使用托盘菜单中的“退出”。</p></div></div>
     <div className="warning-box"><strong>请求体没有应用层大小限制</strong><p>Responses 请求体会直接流式转发，不读取成完整 JSON。内容记录关闭时不会写入磁盘；仅有 60 秒上传空闲超时。</p></div>
   </section>;

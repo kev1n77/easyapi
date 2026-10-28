@@ -1,0 +1,117 @@
+name: nightly
+
+on:
+  schedule:
+    # 02:00 Asia/Shanghai
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-windows
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows package
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Ensure VBScript for WiX
+        run: |
+          $cscript = Get-Command cscript.exe -ErrorAction SilentlyContinue
+          if ($cscript) {
+            Write-Host "cscript present: $($cscript.Source)"
+          }
+          $info = & dism.exe /online /get-featureinfo /featurename:VBSCRIPT
+          $info | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            if ($cscript) {
+              Write-Host 'VBSCRIPT is not an optional feature on this image; cscript is already available'
+              exit 0
+            }
+            Write-Error 'VBScript is unavailable, so WiX cannot build an MSI'
+            exit 1
+          }
+          if ($info -match 'State : Enabled') {
+            Write-Host 'VBSCRIPT already enabled'
+            exit 0
+          }
+          & dism.exe /online /enable-feature /featurename:VBSCRIPT /all /norestart
+          if ($LASTEXITCODE -eq 3010) { exit 0 }
+          exit $LASTEXITCODE
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Build Windows installers
+        run: pnpm exec tauri build --bundles nsis,msi
+
+      - name: Upload NSIS installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: easyapi-windows-nsis
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload MSI installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: easyapi-windows-msi
+          path: src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish nightly release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+          name: EasyAPI Nightly #${{ github.run_number }}
+          prerelease: true
+          make_latest: false
+          body: |
+            Windows nightly build from `${{ github.sha }}`.
+
+            - NSIS setup executable
+            - MSI installer
+          files: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/msi/*.msi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
