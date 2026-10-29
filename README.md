@@ -137,7 +137,11 @@ supports_websockets = false
 request_max_retries = 0
 stream_max_retries = 0
 stream_idle_timeout_ms = 300000
+requires_openai_auth = false
+http_headers = { "x-openai-actor-authorization" = "easyapi" }
 ```
+
+`x-openai-actor-authorization` 用于让 Codex 注册内置生图工具。EasyAPI 仅在本地配置中使用该标记，转发给上游前会将其移除；修改配置后请完全退出 Codex，再新建会话。
 
 模型仍由原有 Codex 配置决定，例如：
 

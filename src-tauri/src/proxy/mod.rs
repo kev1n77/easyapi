@@ -887,6 +887,14 @@ fn is_sse_prefix(bytes: &[u8]) -> bool {
 }
 
 fn should_forward_request_header(name: &HeaderName) -> bool {
+    // Codex uses this local-only header to advertise its built-in image tool.
+    // It must never be sent to an upstream provider as an arbitrary user header.
+    if name
+        .as_str()
+        .eq_ignore_ascii_case("x-openai-actor-authorization")
+    {
+        return false;
+    }
     !matches!(
         name.as_str().to_ascii_lowercase().as_str(),
         "authorization"
@@ -1647,6 +1655,9 @@ mod tests {
     fn filters_hop_by_hop_headers() {
         assert!(!should_forward_request_header(&header::AUTHORIZATION));
         assert!(!should_forward_request_header(&header::CONNECTION));
+        assert!(!should_forward_request_header(&HeaderName::from_static(
+            "x-openai-actor-authorization"
+        )));
         assert!(should_forward_request_header(&header::CONTENT_TYPE));
         assert!(!should_forward_response_header(&header::TRANSFER_ENCODING));
     }

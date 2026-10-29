@@ -218,6 +218,8 @@ supports_websockets = false
 request_max_retries = 0
 stream_max_retries = 0
 stream_idle_timeout_ms = 300000
+requires_openai_auth = false
+http_headers = {{ "x-openai-actor-authorization" = "easyapi" }}
 "#,
         listen_address
     );
@@ -246,10 +248,14 @@ launchctl setenv EASYAPI_LOCAL_TOKEN "$EASYAPI_LOCAL_TOKEN""#
     };
     let authorization =
         serde_json::to_string(&format!("Bearer {local_token}")).expect("string serializes");
-    let config_toml_with_headers = config_toml.replace(
-        "env_key = \"EASYAPI_LOCAL_TOKEN\"",
-        &format!("http_headers = {{ Authorization = {authorization} }}"),
-    );
+    let config_toml_with_headers = config_toml
+        .replace("http_headers = { \"x-openai-actor-authorization\" = \"easyapi\" }\n", "")
+        .replace(
+            "env_key = \"EASYAPI_LOCAL_TOKEN\"",
+            &format!(
+                "http_headers = {{ Authorization = {authorization}, \"x-openai-actor-authorization\" = \"easyapi\" }}"
+            ),
+        );
     CodexSetup {
         config_toml,
         config_toml_with_headers,
@@ -515,11 +521,23 @@ mod tests {
                 .contains("env_key = \"EASYAPI_LOCAL_TOKEN\""));
             assert!(setup
                 .config_toml_with_headers
-                .contains("http_headers = { Authorization = \"Bearer local-token\" }"));
+                .contains("Authorization = \"Bearer local-token\""));
             assert!(!setup.config_toml_with_headers.contains("env_key"));
             assert!(setup
                 .config_toml_with_headers
                 .contains("base_url = \"http://127.0.0.1:8787/v1\""));
+            assert!(setup.config_toml.contains("requires_openai_auth = false"));
+            assert!(setup.config_toml.contains("x-openai-actor-authorization"));
+            assert!(setup
+                .config_toml_with_headers
+                .contains("x-openai-actor-authorization"));
+            assert_eq!(
+                setup
+                    .config_toml_with_headers
+                    .matches("http_headers =")
+                    .count(),
+                1
+            );
         }
     }
 
