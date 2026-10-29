@@ -16,6 +16,14 @@ use tauri::{
 
 use crate::{state::AppState, storage::Database};
 
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -59,14 +67,9 @@ pub fn run() {
                         .expect("default icon exists"),
                 )
                 .menu(&menu)
-                .show_menu_on_left_click(false)
+                .show_menu_on_left_click(cfg!(target_os = "macos"))
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
+                    "show" => show_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -106,6 +109,12 @@ pub fn run() {
             commands::get_codex_oauth_status,
             commands::logout_codex_oauth,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running EasyAPI");
+        .build(tauri::generate_context!())
+        .expect("error while building EasyAPI")
+        .run(|_app, _event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                show_main_window(_app);
+            }
+        });
 }

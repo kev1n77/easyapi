@@ -85,7 +85,8 @@ export type ProviderTestResult = {
 
 export type CodexSetup = {
   configToml: string;
-  powershellCommand: string;
+  environmentCommand: string;
+  platform: string;
   localToken: string;
 };
 

@@ -1,6 +1,6 @@
 # EasyAPI
 
-EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始终连接固定的本地地址，用户可以在桌面界面中手动切换不同的上游 API Key，不需要反复退出 Codex、替换配置文件再启动。
+EasyAPI 是一个面向 Codex Responses API 的 Windows / macOS 本地代理，支持 Apple Silicon 和 Intel Mac。Codex 始终连接固定的本地地址，用户可以在桌面界面中手动切换不同的上游 API Key，不需要反复退出 Codex、替换配置文件再启动。
 
 ## 当前功能
 
@@ -13,17 +13,17 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 - 手动原子切换 Provider
 - 已开始的请求继续使用原 Provider，新请求使用切换后的 Provider
 - 上游容量错误自动重试，并在请求记录中显示重试次数
-- API Key 保存到 Windows Credential Manager
+- API Key 保存到系统凭据库：Windows Credential Manager / macOS Keychain（钥匙串）
 - Provider 元数据和脱敏请求记录保存到 SQLite
 - 运行日志按启动实例落盘并自动轮转
 - 可选记录 Responses 请求和响应的原始内容，默认关闭
 - 本地代理 Bearer Token 验证
-- 系统托盘常驻；关闭窗口只会隐藏
+- 系统托盘 / macOS 菜单栏常驻；关闭窗口只会隐藏，macOS 可通过 Dock 图标重新打开
 - 手动连接测试
 - Codex 官方 ChatGPT Plus/Pro 订阅 OAuth 登录，自动刷新 access token
 - 官方订阅也作为 EasyAPI 内部 Provider，可在不重启 Codex 的情况下切换
 - 官方订阅的 Responses 请求会流式兼容 ChatGPT Codex 后端：移除顶层 `max_output_tokens`，并强制使用 `store: false`。生图和改图请求保持原样转发
-- Codex 配置和 PowerShell 环境变量命令生成
+- Codex 配置和平台对应的环境变量命令生成（Windows PowerShell / macOS zsh）
 
 ## 明确不做的事情
 
@@ -41,7 +41,7 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 - Tauri 2
 - React 19、TypeScript、Vite
 - SQLite（rusqlite）
-- Windows Credential Manager（keyring）
+- Windows Credential Manager / macOS Keychain（keyring）
 
 ## 运行
 
@@ -49,39 +49,53 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows 本地代理。Codex 始
 
 - Rust stable
 - Node.js 22+
-- pnpm
-- Windows WebView2
+- pnpm 10
+- Windows：WebView2、Visual Studio C++ Build Tools
+- macOS 11 或更新版本：Xcode Command Line Tools（`xcode-select --install`）；使用系统内置 WKWebView，无需 WebView2
 
 安装依赖：
 
-```powershell
+```sh
 pnpm install
 ```
 
 开发模式：
 
-```powershell
+```sh
 pnpm tauri dev
 ```
 
 前端构建：
 
-```powershell
+```sh
 pnpm build
 ```
 
 Rust 检查和测试：
 
-```powershell
-cargo check --manifest-path .\src-tauri\Cargo.toml
-cargo test --manifest-path .\src-tauri\Cargo.toml
+```sh
+cargo check --manifest-path src-tauri/Cargo.toml --locked
+cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
+
+集成测试使用 `127.0.0.1` 上的模拟上游。如果本机启用了系统 HTTP 代理，请确保回环地址绕过代理；在 macOS 上可用 `NO_PROXY=127.0.0.1,localhost cargo test --manifest-path src-tauri/Cargo.toml --locked` 运行测试。
 
 完整桌面构建：
 
-```powershell
+```sh
 pnpm tauri build
 ```
+
+在 Mac 上构建会生成当前机器架构的 `.app` 和 `.dmg`，位于 `src-tauri/target/release/bundle/`。如果需要同时支持两种架构的通用安装包，可在 Mac 上执行：
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+pnpm tauri build --target universal-apple-darwin
+```
+
+通用安装包位于 `src-tauri/target/universal-apple-darwin/release/bundle/`。CI 分别检查 Windows、Apple Silicon Mac 和 Intel Mac；nightly 构建会在同一个 Release 中提供 Windows 安装包及两种 Mac 架构的 DMG（`aarch64` 为 Apple Silicon，`x64` 为 Intel）。
+
+当前 macOS 安装包尚未配置 Developer ID 签名和 Apple 公证。下载后先将 `EasyAPI.app` 拖入“应用程序”；如果首次打开被 Gatekeeper 拦截，在确认下载来源后，可在“系统设置 → 隐私与安全性”中选择“仍要打开”。首次保存或读取 API Key 时，系统可能要求允许 EasyAPI 访问登录钥匙串。
 
 ## 使用步骤
 
@@ -94,11 +108,17 @@ pnpm tauri build
    - 官方 ChatGPT Plus/Pro 订阅可选择“ChatGPT 官方订阅 OAuth”，然后完成浏览器设备码登录
 3. 点击“切换”，激活该 Provider。
 4. 打开“Codex 配置”页面。
-5. 执行页面生成的 PowerShell 命令，设置 `EASYAPI_LOCAL_TOKEN` 用户环境变量。
+5. 执行页面按系统生成的命令，设置 `EASYAPI_LOCAL_TOKEN`：Windows 使用 PowerShell，macOS 使用终端中的 zsh。
 6. 将页面生成的 Provider 配置加入用户级 `~/.codex/config.toml`。
 7. 重启一次 Codex。以后切换上游不再需要重启 Codex。
 
 官方 OAuth 的凭据由 EasyAPI 单独保存并在请求时刷新；Codex 始终只看到 `easyapi` 这一个本地 Provider，因此切换到或离开官方订阅不会改变 Codex 的会话列表归属。
+
+macOS 的配置命令会将 `export EASYAPI_LOCAL_TOKEN=…` 写入 `${ZDOTDIR:-$HOME}/.zshrc`，使以后从 zsh 终端启动的 Codex 自动继承 Token；重复执行同一命令不会重复添加配置。命令还会通过 `launchctl setenv` 设置当前登录会话的桌面应用环境变量。执行后需完全退出 Codex（⌘Q）再打开。
+
+`launchctl setenv` 在注销或重启后会失效：从 Dock / Finder 启动 Codex 前，需重新执行页面中的命令。使用 bash、fish 等其他 Shell 时，需要自行把 Token 的导出配置加入对应启动文件。
+
+macOS 关闭 EasyAPI 窗口后，代理仍会继续运行。点击 Dock 图标或菜单栏图标中的“显示 EasyAPI”可恢复窗口；菜单中的“退出”或 ⌘Q 会停止代理并退出应用。
 
 示例配置：
 
@@ -199,7 +219,8 @@ Content-Length
 上游 API Key：
 
 ```text
-Windows Credential Manager
+Windows: Credential Manager
+macOS: Keychain（登录钥匙串）
 service = easyapi
 username = provider:<provider-id>
 ```
@@ -214,6 +235,13 @@ username = provider:<provider-id>
 
 ```text
 %APPDATA%\com.wsp.easyapi\logs\easyapi-YYYYMMDD-HHMMSS-PID.log
+```
+
+macOS 使用以下目录：
+
+```text
+~/Library/Application Support/com.wsp.easyapi/easyapi.sqlite3
+~/Library/Application Support/com.wsp.easyapi/logs/easyapi-YYYYMMDD-HHMMSS-PID.log
 ```
 
 每次启动创建一个新的日志文件；单个文件达到 10 MiB 后轮转，最多保留两个轮转文件（`.1`、`.2`）。启动日志组最多保留最近 10 组，旧组会在新启动时自动删除。对于 Responses 请求，日志会记录请求 ID、Provider、上游地址、请求大小、HTTP 状态与版本、关键响应头、响应字节数、数据块数量与间隔、最后一个 SSE 事件及上游错误分类，便于定位长流中断。日志不会记录 API Key、Authorization Header 或请求正文。
@@ -267,5 +295,7 @@ src-tauri/src/
 - Provider Base URL 规范化
 - 禁止覆盖 Authorization
 - 使用模拟上游验证请求和 SSE 响应流式转发
+- Windows / macOS 使用正确的原生凭据库后端
+- 平台配置命令生成；在 macOS 上验证 zsh 命令可重复执行、保留原有配置并正确转义 Token
 
 测试不会调用真实模型 API。

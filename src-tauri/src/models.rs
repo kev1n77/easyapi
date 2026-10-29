@@ -125,6 +125,7 @@ pub struct ProviderTestResult {
 #[serde(rename_all = "camelCase")]
 pub struct CodexSetup {
     pub config_toml: String,
-    pub powershell_command: String,
+    pub environment_command: String,
+    pub platform: String,
     pub local_token: String,
 }

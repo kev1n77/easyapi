@@ -509,10 +509,10 @@ function SetupPage({ setup }: { setup: CodexSetup | null }) {
   }
   if (!setup) return <div className="empty">正在加载配置…</div>;
   return <section>
-    <PageHeader title="Codex 配置" subtitle="只需配置一次，之后所有上游切换都在 EasyAPI 内完成。" />
-    <div className="setup-step"><span>1</span><div><h3>设置本地认证 Token</h3><p>在 PowerShell 中执行，然后重启一次 Codex 使用户环境变量生效。</p><CodeBlock value={setup.powershellCommand} copied={copied === "ps"} onCopy={() => void copy("ps", setup.powershellCommand)} /></div></div>
+    <PageHeader title="Codex 配置" subtitle="完成以下配置后，所有上游切换都在 EasyAPI 内完成。" />
+    <div className="setup-step"><span>1</span><div><h3>设置本地认证 Token</h3><p>{setup.platform === "macos" ? "在终端（zsh）中执行。命令会将 Token 写入 .zshrc，并设置当前登录会话的桌面应用环境变量；随后完全退出并重新打开 Codex。" : setup.platform === "windows" ? "在 PowerShell 中执行，然后重启一次 Codex 使用户环境变量生效。" : "在终端中执行，并从同一终端启动 Codex。"}</p>{setup.platform === "macos" && <p>重启 Mac 或重新登录后，终端启动的 Codex 会自动读取 Token；从 Dock 或 Finder 启动前，请再执行一次下面的命令。使用其他 Shell 时，请将 export 行加入对应的启动配置。</p>}<CodeBlock value={setup.environmentCommand} copied={copied === "env"} onCopy={() => void copy("env", setup.environmentCommand)} /></div></div>
     <div className="setup-step"><span>2</span><div><h3>修改用户级 config.toml</h3><p>把下面配置加入 <code>~/.codex/config.toml</code>。模型名称仍由你现有的 Codex 配置决定。</p><CodeBlock value={setup.configToml} copied={copied === "toml"} onCopy={() => void copy("toml", setup.configToml)} /></div></div>
-    <div className="setup-step"><span>3</span><div><h3>保持 EasyAPI 运行</h3><p>关闭窗口会隐藏到系统托盘，不会停止代理。需要完全关闭时使用托盘菜单中的“退出”。</p></div></div>
+    <div className="setup-step"><span>3</span><div><h3>保持 EasyAPI 运行</h3><p>{setup.platform === "macos" ? "关闭窗口后代理会继续运行。点击 Dock 图标或菜单栏图标中的“显示 EasyAPI”可重新打开窗口；使用菜单中的“退出”或 ⌘Q 完全退出。" : "关闭窗口会隐藏到系统托盘，不会停止代理。需要完全关闭时使用托盘菜单中的“退出”。"}</p></div></div>
     <div className="warning-box"><strong>请求体没有应用层大小限制</strong><p>Responses 请求体会直接流式转发，不读取成完整 JSON。内容记录关闭时不会写入磁盘；仅有 60 秒上传空闲超时。</p></div>
   </section>;
 }
@@ -556,7 +556,7 @@ function ProviderDialog({ provider, onClose, onSaved }: { provider?: Provider; o
   }
   return <div className="dialog-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <form className="dialog" onSubmit={submit}>
-      <div className="dialog-header"><div><h2>{provider ? "编辑 Provider" : "添加 Provider"}</h2><p>API Key 保存到 Windows Credential Manager；OAuth 凭据由 EasyAPI 单独保存。</p></div><button type="button" onClick={onClose}>×</button></div>
+      <div className="dialog-header"><div><h2>{provider ? "编辑 Provider" : "添加 Provider"}</h2><p>API Key 保存到系统凭据库（Windows 凭据管理器 / macOS 钥匙串）；OAuth 凭据由 EasyAPI 单独保存。</p></div><button type="button" onClick={onClose}>×</button></div>
       {error && <div className="form-error">{error}</div>}
       <label><span>名称</span><input autoFocus value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="例如 API-A" /></label>
       <label><span>认证方式</span><select value={form.authType} onChange={e => setForm({ ...form, authType: e.target.value as ProviderInput["authType"], baseUrl: e.target.value === "codex_oauth" ? "https://chatgpt.com/backend-api/codex" : form.baseUrl })}><option value="api_key">API Key</option><option value="codex_oauth">ChatGPT 官方订阅 OAuth</option></select></label>

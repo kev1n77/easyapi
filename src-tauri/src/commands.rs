@@ -188,6 +188,14 @@ pub fn clear_request_logs(state: State<'_, Arc<AppState>>) -> Result<(), String>
 
 #[tauri::command]
 pub fn get_codex_setup(state: State<'_, Arc<AppState>>) -> CodexSetup {
+    build_codex_setup(
+        &state.listen_address,
+        &state.local_token,
+        std::env::consts::OS,
+    )
+}
+
+fn build_codex_setup(listen_address: &str, local_token: &str, platform: &str) -> CodexSetup {
     let config_toml = format!(
         r#"model_provider = "easyapi"
 
@@ -201,18 +209,41 @@ request_max_retries = 0
 stream_max_retries = 0
 stream_idle_timeout_ms = 300000
 "#,
-        state.listen_address
+        listen_address
     );
-    let escaped = state.local_token.clone();
-    let powershell_command = format!(
-        "[Environment]::SetEnvironmentVariable(\"EASYAPI_LOCAL_TOKEN\", \"{}\", \"User\")",
-        escaped
-    );
+    let environment_command = match platform {
+        "windows" => format!(
+            "[Environment]::SetEnvironmentVariable('EASYAPI_LOCAL_TOKEN', '{}', 'User')\n$env:EASYAPI_LOCAL_TOKEN = '{}'",
+            local_token.replace('\'', "''"),
+            local_token.replace('\'', "''"),
+        ),
+        "macos" => {
+            let export = format!("export EASYAPI_LOCAL_TOKEN={}", shell_quote(local_token));
+            let quoted_export = shell_quote(&export);
+            // zsh startup files configure CLI launches. launchctl also configures
+            // apps opened from Finder/Dock, for the current login session only.
+            format!(
+                r#"{export}
+easyapi_zshrc="${{ZDOTDIR:-$HOME}}/.zshrc"
+touch "$easyapi_zshrc"
+if ! grep -Fqx -- {quoted_export} "$easyapi_zshrc"; then
+  printf '\n%s\n' {quoted_export} >> "$easyapi_zshrc"
+fi
+launchctl setenv EASYAPI_LOCAL_TOKEN "$EASYAPI_LOCAL_TOKEN""#
+            )
+        }
+        _ => format!("export EASYAPI_LOCAL_TOKEN={}", shell_quote(local_token)),
+    };
     CodexSetup {
         config_toml,
-        powershell_command,
-        local_token: state.local_token.clone(),
+        environment_command,
+        platform: platform.to_string(),
+        local_token: local_token.to_string(),
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[tauri::command]
@@ -457,6 +488,73 @@ fn summarize_upstream_error(status: u16, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generates_windows_setup_with_literal_token() {
+        let setup = build_codex_setup("127.0.0.1:8787", "token'$value", "windows");
+        assert_eq!(setup.platform, "windows");
+        assert!(setup
+            .config_toml
+            .contains("base_url = \"http://127.0.0.1:8787/v1\""));
+        assert!(setup
+            .config_toml
+            .contains("env_key = \"EASYAPI_LOCAL_TOKEN\""));
+        assert!(setup
+            .environment_command
+            .contains("'token''$value', 'User'"));
+        assert!(setup
+            .environment_command
+            .contains("$env:EASYAPI_LOCAL_TOKEN = 'token''$value'"));
+        assert!(!setup.environment_command.contains("launchctl"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_setup_preserves_zshrc_and_round_trips_token() {
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let zsh_dir = temp.path().join("shell config");
+        std::fs::create_dir(&zsh_dir).unwrap();
+        let zshrc = zsh_dir.join(".zshrc");
+        std::fs::write(&zshrc, "# Existing settings without a trailing newline").unwrap();
+        let token = "test token'\"$HOME`whoami`";
+        let setup = build_codex_setup("127.0.0.1:8787", token, "macos");
+        assert_eq!(setup.platform, "macos");
+        // Stub launchctl so the test never changes the user's login environment.
+        let script = format!(
+            "launchctl() {{ [[ $# = 3 && $1 = setenv && $2 = EASYAPI_LOCAL_TOKEN && $3 = $EXPECTED_TOKEN ]]; }}\n{}\n",
+            setup.environment_command,
+        );
+        for _ in 0..2 {
+            let output = Command::new("/bin/zsh")
+                .args(["-efc", &script])
+                .env("ZDOTDIR", &zsh_dir)
+                .env("EXPECTED_TOKEN", token)
+                .env_remove("EASYAPI_LOCAL_TOKEN")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let saved = std::fs::read_to_string(&zshrc).unwrap();
+        assert!(saved.starts_with("# Existing settings without a trailing newline\n"));
+        assert_eq!(saved.matches("export EASYAPI_LOCAL_TOKEN=").count(), 1);
+        let output = Command::new("/bin/zsh")
+            .args([
+                "-efc",
+                "source \"$ZDOTDIR/.zshrc\"; printf '%s' \"$EASYAPI_LOCAL_TOKEN\"",
+            ])
+            .env("ZDOTDIR", &zsh_dir)
+            .env_remove("EASYAPI_LOCAL_TOKEN")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), token);
+    }
 
     #[test]
     fn normalizes_provider_base_url() {

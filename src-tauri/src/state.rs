@@ -386,6 +386,22 @@ impl ProviderManager {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn credentials_use_macos_keychain_backend() {
+        let entry = credential_entry("backend-check").unwrap();
+        assert!(entry.get_credential().is::<keyring::macos::MacCredential>());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn credentials_use_windows_native_backend() {
+        let entry = credential_entry("backend-check").unwrap();
+        assert!(entry
+            .get_credential()
+            .is::<keyring::windows::WinCredential>());
+    }
+
     fn oauth_provider() -> Provider {
         Provider {
             id: "official".to_string(),
