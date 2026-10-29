@@ -24,7 +24,7 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows / macOS 本地代理，m
 - 官方订阅也作为 EasyAPI 内部 Provider，可在不重启 Codex 的情况下切换
 - 官方订阅的 Responses 请求会流式兼容 ChatGPT Codex 后端：移除顶层 `max_output_tokens`，并强制使用 `store: false`。生图和改图请求保持原样转发
 - Codex 配置和平台对应的环境变量命令生成（Windows PowerShell / macOS zsh）
-- Codex 配置页同时提供 `env_key` 和 `http_headers` 两种本地认证方式，Windows / macOS 一致
+- Codex 配置页提供 `env_key` 本地认证配置，以及 Windows / macOS 对应的本机地址绕过代理命令
 - 上游网络可选择系统代理、直连或手动 HTTP / HTTPS / SOCKS5 代理；本机上游服务始终绕过代理
 
 ## 明确不做的事情
@@ -113,14 +113,6 @@ macOS 的配置命令会将 `export EASYAPI_LOCAL_TOKEN=…` 写入 `${ZDOTDIR:-
 
 `launchctl setenv` 在注销或重启后会失效：从 Dock / Finder 启动 Codex 前，需重新执行页面中的命令。使用 bash、fish 等其他 Shell 时，需要自行把 Token 的导出配置加入对应启动文件。
 
-Windows 和 macOS 的配置页均提供 `http_headers` 替代方案。可以将 `[model_providers.easyapi]` 中的 `env_key` 行替换为下面一行，使用页面显示的实际本地 Token，无需设置环境变量：
-
-```toml
-http_headers = { Authorization = "Bearer easyapi-你的本地Token" }
-```
-
-该配置包含本地 Token，请勿公开分享。`http_headers` 与 `env_key` 两种方式选择一种即可。Codex 的 [官方配置参考](https://developers.openai.com/codex/config-reference/) 说明了这两项设置。
-
 macOS 关闭 EasyAPI 窗口后，代理仍会继续运行。点击 Dock 图标或菜单栏图标中的“显示 EasyAPI”可恢复窗口；菜单中的“退出”或 ⌘Q 会停止代理并退出应用。
 
 示例配置：
@@ -177,6 +169,20 @@ Provider 和手动代理地址都不能指向 EasyAPI 自己的 8787 端口，�
 2. 如果没有记录，先确认 EasyAPI 正在运行，并让 Codex 所使用的代理软件绕过 `127.0.0.1`、`localhost` 和 `::1`。EasyAPI 的上游网络设置不能改变 Codex 自己的网络路由。
 3. 在终端执行 `curl --noproxy '*' http://127.0.0.1:8787/healthz`；Windows 可使用 `curl.exe`。正常情况下应返回 `status: ok` 的 JSON。
 4. 本地 Token 缺失或错误通常返回 401；Provider 地址指向 EasyAPI 自身会返回明确的配置错误。
+
+Windows 上可以在 PowerShell 中执行以下命令，然后完全退出并重新打开 Codex。命令会保留现有绕过地址，将本机地址写入用户级 `NO_PROXY`，并立即应用到当前 PowerShell；重启后仍然有效。从终端启动 Codex 时，请使用新的终端窗口或当前 PowerShell。
+
+```powershell
+$easyapiNoProxy = @(
+  $env:NO_PROXY
+  [Environment]::GetEnvironmentVariable('NO_PROXY', 'User')
+  [Environment]::GetEnvironmentVariable('NO_PROXY', 'Machine')
+  '127.0.0.1,localhost,::1'
+) -join ','
+$easyapiNoProxy = ($easyapiNoProxy -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) -join ','
+[Environment]::SetEnvironmentVariable('NO_PROXY', $easyapiNoProxy, 'User')
+$env:NO_PROXY = $easyapiNoProxy
+```
 
 macOS 上如果 Codex 的本机请求被代理截获，可以在终端执行以下命令，然后完全退出并重新打开 Codex：
 

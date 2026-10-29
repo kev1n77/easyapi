@@ -519,6 +519,15 @@ function SettingsPage({ settings, onSave }: {
 function SetupPage({ setup }: { setup: CodexSetup | null }) {
   const [copied, setCopied] = useState<string | null>(null);
   const macProxyBypassCommand = 'export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost,::1"\nexport no_proxy="$NO_PROXY"\nlaunchctl setenv NO_PROXY "$NO_PROXY"\nlaunchctl setenv no_proxy "$NO_PROXY"';
+  const windowsProxyBypassCommand = `$easyapiNoProxy = @(
+  $env:NO_PROXY
+  [Environment]::GetEnvironmentVariable('NO_PROXY', 'User')
+  [Environment]::GetEnvironmentVariable('NO_PROXY', 'Machine')
+  '127.0.0.1,localhost,::1'
+) -join ','
+$easyapiNoProxy = ($easyapiNoProxy -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique) -join ','
+[Environment]::SetEnvironmentVariable('NO_PROXY', $easyapiNoProxy, 'User')
+$env:NO_PROXY = $easyapiNoProxy`;
   async function copy(label: string, value: string) {
     await navigator.clipboard.writeText(value);
     setCopied(label);
@@ -527,11 +536,11 @@ function SetupPage({ setup }: { setup: CodexSetup | null }) {
   if (!setup) return <div className="empty">正在加载配置…</div>;
   return <section>
     <PageHeader title="Codex 配置" subtitle="完成以下配置后，所有上游切换都在 EasyAPI 内完成。" />
-    <div className="setup-step"><span>1</span><div><h3>设置本地认证 Token</h3><p>使用第 2 步的 http_headers 方案时，可以跳过本步。</p><p>{setup.platform === "macos" ? "在终端（zsh）中执行。命令会将 Token 写入 .zshrc，并设置当前登录会话的桌面应用环境变量；随后完全退出并重新打开 Codex。" : setup.platform === "windows" ? "在 PowerShell 中执行，然后重启一次 Codex 使用户环境变量生效。" : "在终端中执行，并从同一终端启动 Codex。"}</p>{setup.platform === "macos" && <p>重启 Mac 或重新登录后，终端启动的 Codex 会自动读取 Token；从 Dock 或 Finder 启动前，请再执行一次下面的命令。使用其他 Shell 时，请将 export 行加入对应的启动配置。</p>}<CodeBlock value={setup.environmentCommand} copied={copied === "env"} onCopy={() => void copy("env", setup.environmentCommand)} /></div></div>
-    <div className="setup-step"><span>2</span><div><h3>修改用户级 config.toml</h3><p>把下面配置加入 <code>~/.codex/config.toml</code>。模型名称仍由你现有的 Codex 配置决定。将 model_provider 放在文件顶层；已有 easyapi 配置时修改原配置，避免重复创建同名表。配置中的 <code>x-openai-actor-authorization</code> 用于让 Codex 注册内置生图工具，EasyAPI 转发前会将其移除。</p><CodeBlock value={setup.configToml} copied={copied === "toml"} onCopy={() => void copy("toml", setup.configToml)} /><details className="setup-alternative"><summary>桌面版也可使用 http_headers，直接填写本地 Token</summary><p>Windows 和 macOS 均支持。下面配置可替代上面的 env_key 方案，无需第 1 步的环境变量；适合从 Dock / Finder 启动 Codex。请选择一种方案。此配置包含本地 Token，请勿公开分享。</p><CodeBlock value={setup.configTomlWithHeaders} copied={copied === "headers"} onCopy={() => void copy("headers", setup.configTomlWithHeaders)} /></details></div></div>
+    <div className="setup-step"><span>1</span><div><h3>设置本地认证 Token</h3><p>{setup.platform === "macos" ? "在终端（zsh）中执行。命令会将 Token 写入 .zshrc，并设置当前登录会话的桌面应用环境变量；随后完全退出并重新打开 Codex。" : setup.platform === "windows" ? "在 PowerShell 中执行，然后重启一次 Codex 使用户环境变量生效。" : "在终端中执行，并从同一终端启动 Codex。"}</p>{setup.platform === "macos" && <p>重启 Mac 或重新登录后，终端启动的 Codex 会自动读取 Token；从 Dock 或 Finder 启动前，请再执行一次下面的命令。使用其他 Shell 时，请将 export 行加入对应的启动配置。</p>}<CodeBlock value={setup.environmentCommand} copied={copied === "env"} onCopy={() => void copy("env", setup.environmentCommand)} /></div></div>
+    <div className="setup-step"><span>2</span><div><h3>修改用户级 config.toml</h3><p>把下面配置加入 <code>~/.codex/config.toml</code>。模型名称仍由你现有的 Codex 配置决定。将 model_provider 放在文件顶层；已有 easyapi 配置时修改原配置，避免重复创建同名表。配置中的 <code>x-openai-actor-authorization</code> 用于让 Codex 注册内置生图工具，EasyAPI 转发前会将其移除。</p><CodeBlock value={setup.configToml} copied={copied === "toml"} onCopy={() => void copy("toml", setup.configToml)} /></div></div>
     <div className="setup-step"><span>3</span><div><h3>保持 EasyAPI 运行</h3><p>{setup.platform === "macos" ? "关闭窗口后代理会继续运行。点击 Dock 图标或菜单栏图标中的“显示 EasyAPI”可重新打开窗口；使用菜单中的“退出”或 ⌘Q 完全退出。" : "关闭窗口会隐藏到系统托盘，不会停止代理。需要完全关闭时使用托盘菜单中的“退出”。"}</p></div></div>
     <div className="warning-box"><strong>请求体没有应用层大小限制</strong><p>Responses 请求体会直接流式转发，不读取成完整 JSON。内容记录关闭时不会写入磁盘；仅有 60 秒上传空闲超时。</p></div>
-    <div className="warning-box"><strong>遇到 502 时检查请求链路</strong><p>先查看 EasyAPI 的“请求记录”。有记录时检查上游服务和“设置 → 上游网络”；无记录时，先确认 Codex 连接的是 http://127.0.0.1:8787/v1，并让代理软件绕过 127.0.0.1 和 localhost。缺少本地 Token 通常返回 401。</p>{setup.platform === "macos" && <details className="setup-alternative"><summary>macOS：为新启动的 Codex 设置本机地址绕过代理</summary><p>在终端执行下方命令，再完全退出并重新打开 Codex。这些环境变量对当前登录会话有效；如果代理软件使用 TUN / 透明代理模式，还需在该软件中将回环地址设为直连。</p><CodeBlock value={macProxyBypassCommand} copied={copied === "bypass"} onCopy={() => void copy("bypass", macProxyBypassCommand)} /></details>}</div>
+    <div className="warning-box"><strong>遇到 502 时检查请求链路</strong><p>先查看 EasyAPI 的“请求记录”。有记录时检查上游服务和“设置 → 上游网络”；无记录时，先确认 Codex 连接的是 http://127.0.0.1:8787/v1，并让代理软件绕过 127.0.0.1 和 localhost。缺少本地 Token 通常返回 401。</p>{(setup.platform === "macos" || setup.platform === "windows") && <details className="setup-alternative"><summary>{setup.platform === "windows" ? "Windows" : "macOS"}：为新启动的 Codex 设置本机地址绕过代理</summary><p>{setup.platform === "windows" ? "在 PowerShell 中执行下方命令，再完全退出并重新打开 Codex。命令会保留现有的绕过地址，并将本机地址添加到用户级 NO_PROXY 环境变量，重启后仍然有效；从终端启动 Codex 时，请使用新的终端窗口或当前 PowerShell。" : "在终端执行下方命令，再完全退出并重新打开 Codex。这些环境变量对当前登录会话有效。"}如果代理软件使用 TUN / 透明代理模式，还需在该软件中将回环地址设为直连。</p><CodeBlock value={setup.platform === "windows" ? windowsProxyBypassCommand : macProxyBypassCommand} copied={copied === "bypass"} onCopy={() => void copy("bypass", setup.platform === "windows" ? windowsProxyBypassCommand : macProxyBypassCommand)} /></details>}</div>
   </section>;
 }
 
