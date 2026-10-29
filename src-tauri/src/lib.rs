@@ -2,6 +2,7 @@ mod codex_oauth;
 mod commands;
 mod logging;
 mod models;
+mod network;
 mod proxy;
 mod state;
 mod storage;
@@ -97,6 +98,7 @@ pub fn run() {
             commands::get_content_capture_status,
             commands::set_content_capture_enabled,
             commands::get_proxy_settings,
+            commands::set_proxy_settings,
             commands::set_upstream_connect_timeout_seconds,
             commands::get_request_capture,
             commands::clear_request_captures,

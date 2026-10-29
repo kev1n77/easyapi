@@ -24,6 +24,8 @@ EasyAPI 是一个面向 Codex Responses API 的 Windows / macOS 本地代理，m
 - 官方订阅也作为 EasyAPI 内部 Provider，可在不重启 Codex 的情况下切换
 - 官方订阅的 Responses 请求会流式兼容 ChatGPT Codex 后端：移除顶层 `max_output_tokens`，并强制使用 `store: false`。生图和改图请求保持原样转发
 - Codex 配置和平台对应的环境变量命令生成（Windows PowerShell / macOS zsh）
+- Codex 配置页同时提供 `env_key` 和 `http_headers` 两种本地认证方式，Windows / macOS 一致
+- 上游网络可选择系统代理、直连或手动 HTTP / HTTPS / SOCKS5 代理；本机上游服务始终绕过代理
 
 ## 明确不做的事情
 
@@ -78,7 +80,7 @@ cargo check --manifest-path src-tauri/Cargo.toml --locked
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-集成测试使用 `127.0.0.1` 上的模拟上游。如果本机启用了系统 HTTP 代理，请确保回环地址绕过代理；在 macOS 上可用 `NO_PROXY=127.0.0.1,localhost cargo test --manifest-path src-tauri/Cargo.toml --locked` 运行测试。
+集成测试使用 `127.0.0.1` 上的模拟上游；EasyAPI 访问回环地址时始终直连，不受系统代理影响。
 
 完整桌面构建：
 
@@ -111,6 +113,14 @@ macOS 的配置命令会将 `export EASYAPI_LOCAL_TOKEN=…` 写入 `${ZDOTDIR:-
 
 `launchctl setenv` 在注销或重启后会失效：从 Dock / Finder 启动 Codex 前，需重新执行页面中的命令。使用 bash、fish 等其他 Shell 时，需要自行把 Token 的导出配置加入对应启动文件。
 
+Windows 和 macOS 的配置页均提供 `http_headers` 替代方案。可以将 `[model_providers.easyapi]` 中的 `env_key` 行替换为下面一行，使用页面显示的实际本地 Token，无需设置环境变量：
+
+```toml
+http_headers = { Authorization = "Bearer easyapi-你的本地Token" }
+```
+
+该配置包含本地 Token，请勿公开分享。`http_headers` 与 `env_key` 两种方式选择一种即可。Codex 的 [官方配置参考](https://developers.openai.com/codex/config-reference/) 说明了这两项设置。
+
 macOS 关闭 EasyAPI 窗口后，代理仍会继续运行。点击 Dock 图标或菜单栏图标中的“显示 EasyAPI”可恢复窗口；菜单中的“退出”或 ⌘Q 会停止代理并退出应用。
 
 示例配置：
@@ -136,6 +146,44 @@ model = "your-model-name"
 ```
 
 所有上游都需要接受 Codex 发送的模型名称。EasyAPI 当前不会读取或改写请求 JSON 中的 `model` 字段。
+
+## 上游网络和 502 排查
+
+在“设置 → 上游网络”中选择：
+
+- **跟随系统代理**：默认行为，读取系统代理或 EasyAPI 进程的代理环境变量。修改系统代理后重新保存设置或重启 EasyAPI。
+- **直连**：忽略系统和环境变量中的代理，直接连接上游 API。
+- **手动指定代理**：填写代理软件的地址，例如 `http://127.0.0.1:7897` 或 `socks5h://127.0.0.1:7897`。支持 `http`、`https`、`socks5` 和 `socks5h`；`socks5h` 由代理解析远程域名。当前使用本机免认证代理端口，不支持带用户名或密码的地址。
+
+网络设置会持久保存，并应用到后续 API 请求、模型列表、连接测试、生图、改图和 OAuth 登录 / Token 刷新；已开始的请求继续使用原客户端。上游连接超时仍只限制建立连接阶段，OAuth 请求另有 30 秒总超时。
+
+三个地址的用途不同：
+
+| 配置位置 | 示例 | 用途 |
+| --- | --- | --- |
+| Codex 的 `base_url` | `http://127.0.0.1:8787/v1` | Codex 连接 EasyAPI |
+| EasyAPI Provider 的 Base URL | `http://127.0.0.1:3000/v1` 或远程 API 地址 | EasyAPI 连接真正的上游模型服务 |
+| EasyAPI 的手动代理地址 | `http://127.0.0.1:7897` | EasyAPI 通过网络代理访问远程上游 |
+
+Provider 和手动代理地址都不能指向 EasyAPI 自己的 8787 端口，以免请求回环。无论选择哪种代理方式，EasyAPI 访问 `127.0.0.0/8`、`localhost`、`*.localhost`、`::1` 等回环地址的上游服务时始终直连。
+
+遇到 Codex 报 502 时：
+
+1. 查看 EasyAPI“请求记录”。如果对应请求有记录，检查上游服务是否运行、Base URL 是否正确，以及网络代理的地址和协议是否匹配。
+2. 如果没有记录，先确认 EasyAPI 正在运行，并让 Codex 所使用的代理软件绕过 `127.0.0.1`、`localhost` 和 `::1`。EasyAPI 的上游网络设置不能改变 Codex 自己的网络路由。
+3. 在终端执行 `curl --noproxy '*' http://127.0.0.1:8787/healthz`；Windows 可使用 `curl.exe`。正常情况下应返回 `status: ok` 的 JSON。
+4. 本地 Token 缺失或错误通常返回 401；Provider 地址指向 EasyAPI 自身会返回明确的配置错误。
+
+macOS 上如果 Codex 的本机请求被代理截获，可以在终端执行以下命令，然后完全退出并重新打开 Codex：
+
+```sh
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost,::1"
+export no_proxy="$NO_PROXY"
+launchctl setenv NO_PROXY "$NO_PROXY"
+launchctl setenv no_proxy "$NO_PROXY"
+```
+
+这些桌面应用环境变量对当前登录会话有效；TUN / 透明代理仍需在代理软件中配置回环地址直连规则。
 
 ## 请求体行为
 
@@ -290,5 +338,7 @@ src-tauri/src/
 - 使用模拟上游验证请求和 SSE 响应流式转发
 - Windows / macOS 使用正确的原生凭据库后端
 - 平台配置命令生成；在 macOS 上验证 zsh 命令可重复执行、保留原有配置并正确转义 Token
+- HTTP 代理和 SOCKS5 远端 DNS 的实际请求转发、本机上游绕过代理、网络设置持久化和旧超时配置迁移
+- 检测并拒绝 Provider 指向 EasyAPI 自身的请求回环
 
 测试不会调用真实模型 API。

@@ -26,6 +26,11 @@ pub fn save_provider(
     mut input: ProviderInput,
 ) -> Result<ProviderView, String> {
     validate_provider_input(&mut input)?;
+    if crate::network::points_to_listener(&input.base_url, &state.listen_address) {
+        return Err(
+            "Provider 的 Base URL 不能指向 EasyAPI 自己，请填写真正上游 API 服务的地址".to_string(),
+        );
+    }
     let id = input
         .id
         .clone()
@@ -152,9 +157,16 @@ pub fn set_content_capture_enabled(
 
 #[tauri::command]
 pub fn get_proxy_settings(state: State<'_, Arc<AppState>>) -> ProxySettings {
-    ProxySettings {
-        upstream_connect_timeout_seconds: state.upstream_connect_timeout_seconds(),
-    }
+    state.proxy_settings()
+}
+
+#[tauri::command]
+pub fn set_proxy_settings(
+    state: State<'_, Arc<AppState>>,
+    settings: ProxySettings,
+) -> Result<ProxySettings, String> {
+    state.set_proxy_settings(settings)?;
+    Ok(state.proxy_settings())
 }
 
 #[tauri::command]
@@ -163,9 +175,7 @@ pub fn set_upstream_connect_timeout_seconds(
     seconds: u64,
 ) -> Result<ProxySettings, String> {
     state.set_upstream_connect_timeout_seconds(seconds)?;
-    Ok(ProxySettings {
-        upstream_connect_timeout_seconds: state.upstream_connect_timeout_seconds(),
-    })
+    Ok(state.proxy_settings())
 }
 
 #[tauri::command]
@@ -234,8 +244,15 @@ launchctl setenv EASYAPI_LOCAL_TOKEN "$EASYAPI_LOCAL_TOKEN""#
         }
         _ => format!("export EASYAPI_LOCAL_TOKEN={}", shell_quote(local_token)),
     };
+    let authorization =
+        serde_json::to_string(&format!("Bearer {local_token}")).expect("string serializes");
+    let config_toml_with_headers = config_toml.replace(
+        "env_key = \"EASYAPI_LOCAL_TOKEN\"",
+        &format!("http_headers = {{ Authorization = {authorization} }}"),
+    );
     CodexSetup {
         config_toml,
+        config_toml_with_headers,
         environment_command,
         platform: platform.to_string(),
         local_token: local_token.to_string(),
@@ -276,7 +293,7 @@ pub async fn test_provider(
         request_body["max_output_tokens"] = serde_json::json!(16);
     }
     let mut request = state
-        .http_client()
+        .http_client(&provider.responses_url())
         .post(provider.responses_url())
         .bearer_auth(token)
         .json(&request_body);
@@ -341,7 +358,7 @@ pub async fn list_provider_models(
         (provider.api_key().to_string(), None)
     };
     let mut request = state
-        .http_client()
+        .http_client(&provider.models_url())
         .get(provider.models_url())
         .bearer_auth(token);
     for (name, value) in &provider.headers {
@@ -488,6 +505,23 @@ fn summarize_upstream_error(status: u16, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_header_setup_is_available_on_both_platforms() {
+        for platform in ["windows", "macos"] {
+            let setup = build_codex_setup("127.0.0.1:8787", "local-token", platform);
+            assert!(setup
+                .config_toml
+                .contains("env_key = \"EASYAPI_LOCAL_TOKEN\""));
+            assert!(setup
+                .config_toml_with_headers
+                .contains("http_headers = { Authorization = \"Bearer local-token\" }"));
+            assert!(!setup.config_toml_with_headers.contains("env_key"));
+            assert!(setup
+                .config_toml_with_headers
+                .contains("base_url = \"http://127.0.0.1:8787/v1\""));
+        }
+    }
 
     #[test]
     fn generates_windows_setup_with_literal_token() {
