@@ -1,6 +1,6 @@
 # EasyAPI
 
-EasyAPI 是一个面向 Codex Responses API 的 Windows / macOS 本地代理，支持 Apple Silicon 和 Intel Mac。Codex 始终连接固定的本地地址，用户可以在桌面界面中手动切换不同的上游 API Key，不需要反复退出 Codex、替换配置文件再启动。
+EasyAPI 是一个面向 Codex Responses API 的 Windows / macOS 本地代理，macOS 安装包面向 Apple Silicon（M 系列芯片）Mac。Codex 始终连接固定的本地地址，用户可以在桌面界面中手动切换不同的上游 API Key，不需要反复退出 Codex、替换配置文件再启动。
 
 ## 当前功能
 
@@ -86,14 +86,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 pnpm tauri build
 ```
 
-在 Mac 上构建会生成当前机器架构的 `.app` 和 `.dmg`，位于 `src-tauri/target/release/bundle/`。如果需要同时支持两种架构的通用安装包，可在 Mac 上执行：
-
-```sh
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
-pnpm tauri build --target universal-apple-darwin
-```
-
-通用安装包位于 `src-tauri/target/universal-apple-darwin/release/bundle/`。CI 分别检查 Windows、Apple Silicon Mac 和 Intel Mac；nightly 构建会在同一个 Release 中提供 Windows 安装包及两种 Mac 架构的 DMG（`aarch64` 为 Apple Silicon，`x64` 为 Intel）。
+在 Apple Silicon Mac 上构建会生成 ARM64 架构的 `.app` 和 `.dmg`，位于 `src-tauri/target/release/bundle/`。CI 检查 Windows 和 Apple Silicon Mac；nightly 构建会在同一个 Release 中提供 Windows EXE/MSI 安装包及 Apple Silicon DMG（`aarch64`）。不构建 Intel Mac 安装包。
 
 当前 macOS 安装包尚未配置 Developer ID 签名和 Apple 公证。下载后先将 `EasyAPI.app` 拖入“应用程序”；如果首次打开被 Gatekeeper 拦截，在确认下载来源后，可在“系统设置 → 隐私与安全性”中选择“仍要打开”。首次保存或读取 API Key 时，系统可能要求允许 EasyAPI 访问登录钥匙串。
 
